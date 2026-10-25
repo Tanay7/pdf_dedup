@@ -198,6 +198,45 @@ Server tests: trash every copy (refused), file edited after the scan
 and an unchanged rescan served from the cache. Point `XDG_DATA_HOME` at a
 temp folder so Linux tests use a throwaway trash.
 
+## Requirement added after pausing: fully offline once shipped
+
+The user's words: "once u ship it it shouldnt access the internet for any
+dependencies etc". What this means for the build:
+
+- **Nothing is downloaded at run time.** The script never calls pip, never
+  checks for updates, and has no telemetry. The report page loads no CDN
+  scripts or web fonts. The server listens only on `127.0.0.1`.
+- **In-process guard:** at start-up, wrap `socket.socket.connect` (and
+  `create_connection`) to refuse any address that isn't loopback, and
+  test that the guard works. This also stops a dependency from quietly
+  reaching out.
+- **AI extra (`--ai`):** never let open_clip or Hugging Face download
+  weights. Load only from a local model folder (`--ai-model PATH`), with
+  `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` set. If the folder is
+  missing, say so and carry on without AI. Torch and the weights
+  (~550 MB) would be a separate, optional offline pack.
+- **OCR extra (`--ocr`):** uses a locally installed Tesseract only.
+- **Dependencies ship with the tool**, so installing needs no internet.
+  The packaging choice is waiting on the user:
+  - (A) An offline zip: `dupefinder.py`, a `wheels/` folder of Windows
+    wheels (cp312 and cp313, win_amd64) and `install.bat`, which runs
+    `pip install --no-index --find-links wheels`. It needs Python
+    installed and stays a readable script.
+  - (B) A standalone `DupeFinder.exe` folder built with PyInstaller
+    (onedir, which starts faster and trips antivirus less than onefile).
+    It needs no Python at all. It requires
+    `multiprocessing.freeze_support()`.
+  - Either way, CI on `windows-latest` builds the bundle and runs the
+    tests against it with networking disabled for the install step.
+- **To shrink the bundle (proposed):** implement pHash (32×32 DCT, 8×8
+  low-frequency block against the median, matching ImageHash) and
+  MinHash/LSH (128 universal-hash permutations, banding into dict
+  buckets) in NumPy. That drops ImageHash, datasketch, SciPy and
+  PyWavelets (about half the wheel size). OpenCV becomes optional
+  (NumPy Laplacian fallback). The core would then be NumPy, Pillow,
+  pillow-heif, PyMuPDF and Send2Trash. This departs from the design's
+  package table, so confirm with the user.
+
 ## Plan for agents when resuming
 
 Write `dupefinder.py` in one context, because its sections share data
