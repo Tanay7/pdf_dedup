@@ -216,8 +216,22 @@ dependencies etc". What this means for the build:
   missing, say so and carry on without AI. Torch and the weights
   (~550 MB) would be a separate, optional offline pack.
 - **OCR extra (`--ocr`):** uses a locally installed Tesseract only.
+- **Decided (user):** offline zip (option A below). The package trim
+  below is left to our judgement and is **adopted**: pHash and
+  MinHash/LSH are written in NumPy, and OpenCV is dropped entirely (the
+  NumPy Laplacian is fast enough at 1,024 px). The core is NumPy, Pillow,
+  pillow-heif, PyMuPDF and Send2Trash. OCR calls `tesseract.exe` directly
+  with `subprocess` (no pytesseract). On Windows, send2trash uses its
+  ctypes back end, so pywin32 isn't needed.
+- **Offline zip contents:** `dupefinder.py`, `wheels/` (win_amd64 wheels
+  for cp312, cp313 and cp314; PyMuPDF is a single abi3 wheel; about 60 MB
+  in all), `install.bat` (`py -m pip install --no-index --find-links
+  wheels -r requirements.txt`), `run.bat` and `README.md`. CI on
+  `windows-latest` builds it and runs the tests against an install done
+  with `--no-index`. The zip goes out as a workflow artifact or a GitHub
+  Release asset, never committed to git.
 - **Dependencies ship with the tool**, so installing needs no internet.
-  The packaging choice is waiting on the user:
+  The packaging options that were considered:
   - (A) An offline zip: `dupefinder.py`, a `wheels/` folder of Windows
     wheels (cp312 and cp313, win_amd64) and `install.bat`, which runs
     `pip install --no-index --find-links wheels`. It needs Python
