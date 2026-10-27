@@ -195,7 +195,7 @@ python -m pip install -r requirements.txt -r requirements-dev.txt
 python -m pytest -q                      # the design's test plan on generated files
 python tests/make_test_files.py OUT      # just build the test folder (add --check)
 node dev/check_report.js                 # browser checks of the report page (Playwright)
-python tools/build_offline_zip.py --portable C:\\Python313   # portable Windows zip (run on Windows)
+python tools/build_offline_zip.py --portable C:\Python313   # portable Windows zip (run on Windows)
 ```
 
 GitHub Actions runs the tests on Windows (Python 3.12–3.14) and Linux. It then
