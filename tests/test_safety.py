@@ -339,3 +339,32 @@ def test_guard_disables_proxies():
     assert urllib.request.getproxies() == {}
     with pytest.raises(OSError):
         socket.gethostbyname("example.com")
+
+
+# -- choosing folders ------------------------------------------------------------------------
+
+def test_split_typed_paths():
+    assert df.split_paths(r'C:\ "D:\My Photos" E:\x') == ["C:\\", "D:\\My Photos", "E:\\x"]
+
+
+def test_pick_option_scans_the_chosen_folders(dataset, tmp_path, monkeypatch):
+    root, _ = dataset
+    monkeypatch.setattr(df, "choose_roots", lambda types: ([str(root / "photos" / "burst")], {"image"}))
+    cache = tmp_path / "cache"
+    assert df.main(["--pick", "--report-only", "--no-browser", "--cache", str(cache)]) == 0
+    assert "burst_3.jpg" in next((cache / "reports").glob("*.csv")).read_text(encoding="utf-8-sig")
+
+
+def test_folder_window(tmp_path):
+    tk = pytest.importorskip("tkinter")
+    try:
+        tk.Tk().destroy()
+    except tk.TclError:
+        pytest.skip("no desktop to show a window on")
+
+    def ready(api):
+        api["add"](str(tmp_path))
+        api["image"].set(False)
+        api["scan"]()
+
+    assert df.pick_folders({"pdf", "image"}, on_ready=ready) == ([os.path.normpath(str(tmp_path))], {"pdf"})

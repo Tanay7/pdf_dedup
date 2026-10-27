@@ -3153,10 +3153,127 @@ def build_parser() -> argparse.ArgumentParser:
     a("--csv", metavar="PATH", help="also export all groups to CSV")
     a("--port", type=int, default=0, help="port for the local server (default: random)")
     a("--no-browser", action="store_true", help="don't open the browser automatically")
+    a("--pick", action="store_true",
+      help="choose the folders to scan in a window (run.bat does this without arguments)")
     a("--undo-review", action="store_true",
       help="move files from _duplicates_review folders back, using the log")
     a("--version", action="version", version=f"%(prog)s {__version__}")
     return p
+
+
+def split_paths(text: str) -> list[str]:
+    r"""Split typed paths; quotes allow spaces: C:\ "D:\My Photos"."""
+    import shlex
+    try:
+        parts = shlex.split(text, posix=False)
+    except ValueError:
+        parts = text.split()
+    return [p.strip('"').strip("'") for p in parts if p.strip('"').strip("'")]
+
+
+def available_drives() -> list[str]:
+    if not IS_WINDOWS:
+        return []
+    import string
+    return [f"{d}:\\" for d in string.ascii_uppercase if os.path.exists(f"{d}:\\")]
+
+
+def pick_folders(types: set[str], on_ready=None):
+    """Window for choosing folders/drives and file types (Python's built-in Tk).
+
+    Returns (folders, types), or None if cancelled. `on_ready(api)` is for tests.
+    """
+    import tkinter as tk
+    from tkinter import filedialog, messagebox
+    if IS_WINDOWS:
+        try:
+            import ctypes
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            pass
+    root = tk.Tk()
+    root.title("DupeFinder - choose what to scan")
+    root.minsize(560, 380)
+    folders: list[str] = []
+    result: dict = {}
+    pad = {"padx": 10, "pady": 4}
+
+    tk.Label(root, text="Folders and drives to scan", font=("Segoe UI", 11, "bold"),
+             anchor="w").pack(fill="x", **pad)
+    box = tk.Listbox(root, selectmode=tk.EXTENDED, height=9, activestyle="none")
+    box.pack(fill="both", expand=True, padx=10)
+
+    def add(path: str):
+        path = os.path.normpath(path)
+        if path and path not in folders:
+            folders.append(path)
+            box.insert(tk.END, path)
+
+    def add_folder():
+        path = filedialog.askdirectory(parent=root, mustexist=True,
+                                       title="Choose a folder or drive to scan")
+        if path:
+            add(path)
+
+    def remove():
+        for i in reversed(box.curselection()):
+            box.delete(i)
+            del folders[i]
+
+    row = tk.Frame(root)
+    row.pack(fill="x", **pad)
+    tk.Button(row, text="Add folder...", command=add_folder).pack(side="left")
+    tk.Button(row, text="Remove", command=remove).pack(side="left", padx=6)
+    drives = available_drives()
+    if drives:
+        tk.Label(row, text="   Whole drive:").pack(side="left")
+        for d in drives:
+            tk.Button(row, text=d, command=lambda d=d: add(d)).pack(side="left", padx=2)
+
+    opts_row = tk.Frame(root)
+    opts_row.pack(fill="x", **pad)
+    want_pdf = tk.BooleanVar(value="pdf" in types)
+    want_img = tk.BooleanVar(value="image" in types)
+    tk.Label(opts_row, text="Look for:").pack(side="left")
+    tk.Checkbutton(opts_row, text="PDFs", variable=want_pdf).pack(side="left", padx=6)
+    tk.Checkbutton(opts_row, text="Photos (JPG, PNG, HEIC)", variable=want_img).pack(side="left")
+    tk.Label(root, text="System and program folders are skipped. Nothing is moved until "
+                        "you confirm it in the report.", fg="#555", anchor="w",
+             justify="left", wraplength=520).pack(fill="x", **pad)
+
+    def scan():
+        chosen = {t for t, v in (("pdf", want_pdf), ("image", want_img)) if v.get()}
+        if not folders:
+            messagebox.showinfo("DupeFinder", "Add at least one folder or drive.", parent=root)
+            return
+        if not chosen:
+            messagebox.showinfo("DupeFinder", "Tick PDFs, Photos or both.", parent=root)
+            return
+        result["value"] = (list(folders), chosen)
+        root.destroy()
+
+    bottom = tk.Frame(root)
+    bottom.pack(fill="x", padx=10, pady=10)
+    tk.Button(bottom, text="Cancel", width=10, command=root.destroy).pack(side="right")
+    tk.Button(bottom, text="Scan", width=10, default="active", command=scan).pack(side="right", padx=6)
+    root.bind("<Return>", lambda e: scan())
+    root.bind("<Escape>", lambda e: root.destroy())
+    if on_ready:
+        root.after(50, lambda: on_ready({"root": root, "add": add, "scan": scan,
+                                         "pdf": want_pdf, "image": want_img}))
+    root.mainloop()
+    return result.get("value")
+
+
+def choose_roots(types: set[str]):
+    """Folder window, or a typed prompt if a window can't be shown."""
+    try:
+        return pick_folders(types)
+    except Exception as e:          # no Tk installed, or no desktop to show it on
+        log.info("Folder window unavailable: %s", e)
+    text = input("Folders or drives to scan (for example C:\\ \"D:\\My Photos\"): ")
+    folders = split_paths(text)
+    return (folders, types) if folders else None
 
 
 def normalize_root(root: str) -> str:
@@ -3181,7 +3298,7 @@ def parse_args(argv=None):
                      "pdf" if t == "pdfs" else t for t in opts.type_set}
     if not opts.type_set or not opts.type_set <= {"pdf", "image"}:
         p.error("--types takes pdf, image or pdf,image")
-    if not opts.undo_review and not opts.roots:
+    if not opts.undo_review and not opts.pick and not opts.roots:
         p.error("give at least one folder or drive to scan, e.g. C:\\ D:\\")
     if not 0 <= opts.max_bits <= 32:
         p.error("--max-bits must be between 0 and 32")
@@ -3247,6 +3364,14 @@ def main(argv=None) -> int:
             except Exception:
                 pass
     opts = parse_args(argv)
+    if opts.pick:
+        picked = choose_roots(opts.type_set)
+        if not picked:
+            print("Nothing chosen to scan.")
+            return 1
+        folders, types = picked
+        rest = [a for a in (sys.argv[1:] if argv is None else argv) if a != "--pick"]
+        opts = parse_args(rest + folders + ["--types", ",".join(sorted(types))])
     install_network_guard()
     os.makedirs(opts.cache, exist_ok=True)
     log_path = setup_logging(opts.cache)

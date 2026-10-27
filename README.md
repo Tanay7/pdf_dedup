@@ -47,12 +47,19 @@ Decisions made while building it are in [docs/BUILD_NOTES.md](docs/BUILD_NOTES.m
 
 ## Use
 
-Double-click **`run.bat`** and type the folders or drives to scan, or run it
-from a Command Prompt:
+Double-click **`run.bat`**. A small window opens:
+- **Add folders:** click **Add folder...** for any folder, or a drive button
+  (`C:\`, `D:\`...) to add a whole drive.
+- **Choose file types:** tick **PDFs** and/or **Photos**.
+- **Start:** press **Scan**.
+
+You can also give folders directly from a Command Prompt; use quotes around
+paths with spaces:
 
 ```
 run.bat C:\ D:\
 run.bat D:\Photos --types image
+run.bat "C:\Users\Tan\Documents\Scans" E:\Backup --prefer D:\Photos
 run.bat D:\Docs --types pdf --min-score 90 --report-only
 run.bat --undo-review
 ```
@@ -145,6 +152,7 @@ only flagged as poor are never pre-selected for the Recycle Bin.
 | `--csv PATH` | none | Also export all groups to CSV |
 | `--port N` | random | Port for the local server |
 | `--no-browser` | off | Don't open the browser automatically |
+| `--pick` | off | Choose folders in a window (what `run.bat` does with no arguments) |
 | `--undo-review` | off | Move files from `_duplicates_review` folders back |
 
 Later scans reuse the fingerprints cached in `cache.sqlite`, so they only
