@@ -1,7 +1,15 @@
 # DupeFinder
 
 One Python script that finds duplicate and near-duplicate **PDFs and photos**
-(JPG, PNG, HEIC) by their content, not their names. It scans folders or whole
+by their content, not their names. Supported photo formats:
+- JPG, PNG and HEIC/HEIF;
+- WebP, AVIF, GIF, BMP and TIFF;
+- camera RAW files: DNG, Canon CR2/CR3, Nikon NEF, Sony ARW, Fujifilm RAF,
+  Olympus ORF, Panasonic RW2, Pentax PEF, Samsung SRW and others.
+
+RAW files are compared through the full-size preview the camera stores
+inside them. A RAW file and its JPEG twin are grouped, but neither is
+pre-selected. It scans folders or whole
 drives such as `C:\` and `D:\` and catches these cases:
 
 - exact copies;

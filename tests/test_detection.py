@@ -249,3 +249,40 @@ def test_rescan_flag_recomputes(dataset, tmp_path):
     run(root, tmp_path / "c", "--types", "pdf")
     again = run(root, tmp_path / "c", "--types", "pdf", "--rescan")
     assert again.result.stats.analysed == len(again.result.recs)
+
+
+# -- more photo formats ---------------------------------------------------------------------
+
+def test_common_photo_formats_and_raw_preview(dataset, tmp_path):
+    from PIL import Image
+    root, _ = dataset
+    work = tmp_path / "fmt"
+    work.mkdir()
+    src = Image.open(root / "photos/beach.jpg")
+    exif = src.getexif()
+    (work / "beach.jpg").write_bytes((root / "photos/beach.jpg").read_bytes())
+    src.save(work / "beach.webp", quality=85)
+    src.save(work / "beach.bmp")
+    src.save(work / "beach.tiff")
+    src.convert("P", palette=Image.Palette.ADAPTIVE).save(work / "beach.gif")
+    try:
+        src.save(work / "beach.avif", quality=70)
+    except Exception:
+        pass
+    # A DNG-like RAW: TIFF container with the camera's EXIF, plus a full-size JPEG preview.
+    thumb = src.resize((256, 192))
+    thumb.save(work / "beach.dng", format="TIFF", exif=exif)
+    with open(work / "beach.dng", "ab") as f:
+        f.write((root / "photos/beach.jpg").read_bytes())
+    s = run(work, tmp_path / "c", "--types", "image")
+    assert not s.result.stats.errors
+    names = [p for p in s.by_rel if p != "beach.jpg"]
+    assert {"beach.webp", "beach.bmp", "beach.tiff", "beach.gif", "beach.dng"} <= set(names)
+    assert s.same_group("beach.jpg", *names)
+    assert kind_of(s.relation("beach.bmp", "beach.jpg")) == "same_pixels"
+    assert kind_of(s.relation("beach.tiff", "beach.jpg")) == "same_pixels"
+    raw = s.rec("beach.dng")
+    assert (raw.meta["w"], raw.meta["h"]) == (2000, 1500) and raw.taken_at is not None
+    assert s.member("beach.dng").suggest == "keep" or s.member("beach.dng").keeper
+    if not s.member("beach.dng").keeper:
+        assert "RAW" in s.member("beach.dng").detail

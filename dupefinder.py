@@ -72,7 +72,14 @@ IS_MAC = sys.platform == "darwin"
 ALGO_VERSION = 1
 
 PDF_EXTS = {".pdf"}
-IMAGE_EXTS = {".jpg", ".jpeg", ".jpe", ".jfif", ".png", ".heic", ".heif"}
+RAW_EXTS = {".dng", ".cr2", ".cr3", ".crw", ".nef", ".nrw", ".arw", ".srf", ".sr2", ".orf",
+            ".rw2", ".raf", ".pef", ".srw", ".rwl", ".3fr", ".iiq", ".erf", ".kdc", ".mos"}
+HEIF_EXTS = {".heic", ".heif", ".hif"}
+IMAGE_EXTS = ({".jpg", ".jpeg", ".jpe", ".jfif", ".png", ".webp", ".avif", ".gif", ".bmp",
+               ".tif", ".tiff"} | HEIF_EXTS | RAW_EXTS)
+BROWSER_IMAGE_TYPES = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".jpe": "image/jpeg",
+                       ".jfif": "image/jpeg", ".png": "image/png", ".webp": "image/webp",
+                       ".avif": "image/avif", ".gif": "image/gif", ".bmp": "image/bmp"}
 
 REDUCED_SIZE = 1024          # photos are analysed at about this long side
 HASH_BITS = 64
@@ -574,7 +581,7 @@ class Walker:
         kind = "pdf" if ext in PDF_EXTS else "image" if ext in IMAGE_EXTS else None
         if kind is None or kind not in self.types:
             return None
-        if kind == "image" and ext in (".heic", ".heif") and not enable_heif():
+        if kind == "image" and ext in HEIF_EXTS and not enable_heif():
             return None
         try:
             st = entry.stat(follow_symlinks=False)
@@ -955,11 +962,91 @@ def normalize_pages(pages: list[str]) -> str:
 # Photos: decoding, EXIF, quality
 # --------------------------------------------------------------------------
 
+class _FileWindow(io.RawIOBase):
+    """Read-only view of a file starting at `offset` (for embedded images)."""
+
+    def __init__(self, f, offset: int):
+        self.f, self.offset = f, offset
+        self.f.seek(offset)
+
+    def readable(self):
+        return True
+
+    def seekable(self):
+        return True
+
+    def seek(self, pos, whence=0):
+        if whence == 0:
+            pos += self.offset
+        return self.f.seek(pos, whence) - self.offset
+
+    def tell(self):
+        return self.f.tell() - self.offset
+
+    def readinto(self, b):
+        data = self.f.read(len(b))
+        b[:len(data)] = data
+        return len(data)
+
+
+TRANSPOSE_FOR_ORIENTATION = {2: "FLIP_LEFT_RIGHT", 3: "ROTATE_180", 4: "FLIP_TOP_BOTTOM",
+                             5: "TRANSPOSE", 6: "ROTATE_270", 7: "TRANSVERSE", 8: "ROTATE_90"}
+
+
+def load_raw(path: str, max_side: int | None):
+    """Camera RAW: decode the largest embedded JPEG preview (no RAW decoder needed)."""
+    import mmap
+    with open(io_path(path), "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+        best, pos, tried = None, 0, 0
+        while tried < 60:
+            off = mm.find(b"\xff\xd8\xff", pos)
+            if off < 0:
+                break
+            pos = off + 3
+            if off + 3 >= len(mm):
+                break
+            if mm[off + 3] not in (0xDB, 0xC0, 0xC4) and not 0xE0 <= mm[off + 3] <= 0xEF:
+                continue
+            tried += 1
+            try:
+                im = Image.open(_FileWindow(f, off))
+                if im.format == "JPEG" and (best is None or im.width * im.height > best[1]):
+                    best = (off, im.width * im.height)
+            except Exception:
+                continue
+        if best is None or best[1] < 160 * 120:
+            raise ValueError("no usable preview image inside this RAW file")
+        im = Image.open(_FileWindow(f, best[0]))
+        exif = im.getexif()
+        if max_side:
+            im.draft("RGB", (max_side, max_side))
+        im.load()
+    if not exif or not exif.get(0x0110):
+        try:                        # TIFF-based RAW: the container holds the EXIF
+            with open(io_path(path), "rb") as f:
+                exif = Image.open(f).getexif()
+        except Exception:
+            pass
+    orientation = int((exif or {}).get(0x0112, 1) or 1)
+    if orientation in TRANSPOSE_FOR_ORIENTATION:
+        im = im.transpose(getattr(Image.Transpose, TRANSPOSE_FOR_ORIENTATION[orientation]))
+    w, h = im.size
+    if max_side and max(im.size) > max_side:
+        im.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
+    return im, {"format": "RAW", "w": w, "h": h, "exif": exif}
+
+
+def is_raw(path: str) -> bool:
+    return os.path.splitext(path)[1].lower() in RAW_EXTS
+
+
 def load_photo(path: str, max_side: int | None):
     """Decode a photo with its rotation applied, reduced to max_side if given.
 
     Returns (image, info) where info has the full-size rotated width/height.
     """
+    if is_raw(path):
+        return load_raw(path, max_side)
     with open(io_path(path), "rb") as f:
         im = Image.open(f)
         fmt = im.format
@@ -2018,6 +2105,9 @@ class Grouper:
                     m.label = link_label(kind, score, extra, shots)
                     if kind in PRESELECT_KINDS:
                         m.suggest = "trash"
+                    if r.kind == "image" and is_raw(r.path) != is_raw(k.path):
+                        m.suggest = "keep"
+                        m.detail = "RAW and non-RAW versions of the same photo, so it isn't pre-selected"
                     if r.kind == "pdf" and kind != "identical" and pdf_has_extra_pages(r, k, o.max_bits):
                         m.suggest = "keep"
                         m.detail = "Has pages the kept copy doesn't, so it isn't pre-selected"
@@ -2461,9 +2551,9 @@ def view_bytes(rec: FileRec) -> tuple[bytes | None, str]:
     if rec.kind == "pdf":
         with open(io_path(rec.path), "rb") as f:
             return f.read(), "application/pdf"
-    if ext in (".jpg", ".jpeg", ".jpe", ".jfif", ".png"):
+    if ext in BROWSER_IMAGE_TYPES:
         with open(io_path(rec.path), "rb") as f:
-            return f.read(), "image/png" if ext == ".png" else "image/jpeg"
+            return f.read(), BROWSER_IMAGE_TYPES[ext]
     im, _ = load_photo(rec.path, 4096)
     buf = io.BytesIO()
     _rgb_for_jpeg(im).save(buf, "JPEG", quality=90)
@@ -3236,7 +3326,7 @@ def pick_folders(types: set[str], on_ready=None):
     want_img = tk.BooleanVar(value="image" in types)
     tk.Label(opts_row, text="Look for:").pack(side="left")
     tk.Checkbutton(opts_row, text="PDFs", variable=want_pdf).pack(side="left", padx=6)
-    tk.Checkbutton(opts_row, text="Photos (JPG, PNG, HEIC)", variable=want_img).pack(side="left")
+    tk.Checkbutton(opts_row, text="Photos (JPG, PNG, HEIC, WebP, TIFF, RAW...)", variable=want_img).pack(side="left")
     tk.Label(root, text="System and program folders are skipped. Nothing is moved until "
                         "you confirm it in the report.", fg="#555", anchor="w",
              justify="left", wraplength=520).pack(fill="x", **pad)
