@@ -103,8 +103,14 @@ IO_REPARSE_TAG_MOUNT_POINT = 0xA0000003
 WINDOWS_ROOT_SYSTEM = {
     "windows", "program files", "program files (x86)", "programdata",
     "$recycle.bin", "system volume information", "recovery",
+    "windows.old", "$windows.~bt", "$windows.~ws", "$winreagent", "$sysreset",
+    "perflogs", "msocache", "config.msi", "onedrivetemp",
 }
-ANYWHERE_SYSTEM = {".git", "node_modules", "venv", ".venv", "site-packages"}
+ANYWHERE_SYSTEM = {".git", "node_modules", "venv", ".venv", "site-packages",
+                   # Game and app libraries keep program files outside Program Files.
+                   "steamapps", "steamlibrary", "epic games", "xboxgames", "windowsapps",
+                   "gog games", "riot games", "ea games", "ubisoft game launcher",
+                   "battle.net", "__pycache__"}
 POSIX_SYSTEM = {
     "/proc", "/sys", "/dev", "/run", "/boot", "/usr", "/bin", "/sbin", "/lib",
     "/lib32", "/lib64", "/libx32", "/etc", "/var", "/snap", "/opt", "/srv",
@@ -337,7 +343,7 @@ def check_dependencies(types: set[str], need_trash: bool) -> list[str]:
 # Data model
 # --------------------------------------------------------------------------
 
-@dataclass
+@dataclass(slots=True)
 class FileRec:
     fid: int
     path: str
@@ -562,6 +568,22 @@ class Walker:
                        nlink=st.st_nlink, system=in_system)
 
 
+def compact_meta(meta: dict) -> dict:
+    """Keep per-file memory small on huge scans (tile values as float32)."""
+    tiles = meta.get("tiles")
+    if isinstance(tiles, list):
+        meta["tiles"] = np.asarray(tiles, dtype=np.float32)
+    return meta
+
+
+def _json_default(v):
+    if isinstance(v, np.ndarray):
+        return [round(float(x), 2) for x in v]
+    if isinstance(v, np.generic):
+        return v.item()
+    raise TypeError(f"not JSON serializable: {type(v)}")
+
+
 # --------------------------------------------------------------------------
 # Scan cache (SQLite)
 # --------------------------------------------------------------------------
@@ -641,7 +663,7 @@ class Cache:
             rec.taken_at, rec.camera, rec.sharpness,
             None if rec.exposure is None else json.dumps(rec.exposure),
             None if rec.embedding is None else np.asarray(rec.embedding, dtype=np.float16).tobytes(),
-            json.dumps(rec.meta), rec.error, ALGO_VERSION, scan_id,
+            json.dumps(rec.meta, default=_json_default), rec.error, ALGO_VERSION, scan_id,
         )
 
     def save(self, recs: list[FileRec], scan_id: int):
@@ -687,7 +709,7 @@ class Cache:
         rec.exposure = json.loads(row["exposure"]) if row["exposure"] else None
         rec.embedding = (None if row["embedding"] is None
                          else np.frombuffer(row["embedding"], dtype=np.float16).astype(np.float32))
-        rec.meta = json.loads(row["meta"]) if row["meta"] else {}
+        rec.meta = compact_meta(json.loads(row["meta"]) if row["meta"] else {})
         rec.error = row["error"]
         rec.analysed = True
 
@@ -1240,15 +1262,17 @@ class WorkerPool:
 
     def run(self, tasks):
         """Run (key, op, arg) tasks; yield (key, ok, result_or_error) as they finish."""
-        queue_ = collections.deque(tasks)
-        want = min(self.size, len(queue_))
-        while len(self.workers) < want:
-            self.workers.append(self._spawn())
+        tasks = iter(tasks)
+        pending = next(tasks, None)
         try:
-            while queue_ or any(w["key"] is not None for w in self.workers):
+            while pending is not None or any(w["key"] is not None for w in self.workers):
+                if pending is not None and len(self.workers) < self.size and \
+                        all(w["key"] is not None for w in self.workers):
+                    self.workers.append(self._spawn())
                 for i, w in enumerate(self.workers):
-                    if w["key"] is None and queue_:
-                        key, op, arg = queue_.popleft()
+                    if w["key"] is None and pending is not None:
+                        key, op, arg = pending
+                        pending = next(tasks, None)
                         try:
                             w["conn"].send((op, arg))
                         except (OSError, ValueError):
@@ -1328,34 +1352,55 @@ def bitcount(x):
     return np.unpackbits(b, axis=-1).sum(axis=-1)
 
 
-def hamming_pairs(h1, thresh: int, h2=None):
+MAX_MATCHES_PER_FILE = 32   # closest matches kept per file; caps memory on huge near-identical sets
+
+
+def hamming_pairs(h1, thresh: int, h2=None, threads: int = 1, progress=None):
     """Index pairs within `thresh` differing bits, compared in blocks with NumPy.
 
     With one array: pairs i < j inside it. With two: every (i in h1, j in h2).
+    Blocks run on several threads (NumPy releases the GIL). Each row keeps at
+    most MAX_MATCHES_PER_FILE closest matches, so thousands of near-identical
+    images can't exhaust memory; groups still join through the kept links.
+    Returns three int arrays (i, j, bits).
     """
     a = np.asarray(h1, dtype=np.uint64)
     b = a if h2 is None else np.asarray(h2, dtype=np.uint64)
-    out_i, out_j, out_d = [], [], []
+    empty = (np.empty(0, np.int64), np.empty(0, np.int64), np.empty(0, np.int64))
     if len(a) == 0 or len(b) == 0:
-        return out_i, out_j, out_d
+        return empty
     block = max(1, (1 << 22) // len(b))
-    for s in range(0, len(a), block):
+    starts = list(range(0, len(a), block))
+    cap = MAX_MATCHES_PER_FILE
+
+    def run_block(s):
         e = min(len(a), s + block)
+        cols = b[s:] if h2 is None else b
+        off = s if h2 is None else 0
+        d = bitcount(a[s:e, None] ^ cols[None, :])
+        mask = d <= thresh
         if h2 is None:
-            d = bitcount(a[s:e, None] ^ b[None, s:])
-            ii, jj = np.nonzero(d <= thresh)
-            keep = jj > ii
-            ii, jj = ii[keep], jj[keep]
-            out_d.extend(d[ii, jj].tolist())
-            out_i.extend((ii + s).tolist())
-            out_j.extend((jj + s).tolist())
-        else:
-            d = bitcount(a[s:e, None] ^ b[None, :])
-            ii, jj = np.nonzero(d <= thresh)
-            out_d.extend(d[ii, jj].tolist())
-            out_i.extend((ii + s).tolist())
-            out_j.extend(jj.tolist())
-    return out_i, out_j, out_d
+            mask &= np.arange(off, off + d.shape[1])[None, :] > np.arange(s, e)[:, None]
+        counts = mask.sum(axis=1)
+        if counts.max(initial=0) > cap:
+            for r in np.nonzero(counts > cap)[0]:
+                row = np.where(mask[r], d[r], 255)
+                keep = np.argpartition(row, cap)[:cap]
+                mask[r] = False
+                mask[r, keep] = True
+        ii, jj = np.nonzero(mask)
+        return ii + s, jj + off, d[ii, jj].astype(np.int64)
+
+    parts, done = [], 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, threads)) as ex:
+        for res in ex.map(run_block, starts):
+            parts.append(res)
+            done += 1
+            if progress and done % 50 == 0:
+                progress(done / len(starts))
+    if not parts:
+        return empty
+    return tuple(np.concatenate([p[k] for p in parts]) for k in range(3))
 
 
 def hamming(a: int, b: int) -> int:
@@ -1395,7 +1440,7 @@ def pdf_visual_score(a: FileRec, b: FileRec, max_bits: int) -> float:
     return min(side(d.min(axis=1)), side(d.min(axis=0)))
 
 
-@dataclass
+@dataclass(slots=True)
 class Link:
     a: int
     b: int
@@ -1405,11 +1450,12 @@ class Link:
 
 
 class Matcher:
-    def __init__(self, recs: list[FileRec], opts, compute):
+    def __init__(self, recs: list[FileRec], opts, compute, progress=None):
         """`compute(op, fids)` fills pixel fingerprints or returns shingle sets."""
         self.recs = recs
         self.opts = opts
         self.compute = compute
+        self.progress = progress
         self.links: dict[tuple, Link] = {}
         self.shingles: dict[int, object] = {}
         self.burst_chain: dict[int, int] = {}
@@ -1425,6 +1471,13 @@ class Matcher:
         if old is None or LINK_PRIORITY[kind] < LINK_PRIORITY[old.kind] or (
                 kind == old.kind and (score or 0) > (old.score or 0)):
             self.links[key] = Link(key[0], key[1], kind, score, extra)
+
+    def hp(self, what: str) -> dict:
+        """Thread count and progress reporting for hamming_pairs()."""
+        report = None
+        if self.progress:
+            report = lambda frac: self.progress(f"Comparing {what}: {frac:.0%}")
+        return {"threads": self.opts.workers, "progress": report}
 
     def photos(self):
         return [r for r in self.recs if r.kind == "image" and r.phash is not None and not r.error]
@@ -1466,9 +1519,9 @@ class Matcher:
         o = self.opts
         photos = [r for r in self.photos() if not r.flat]
         hashes = [r.phash for r in photos]
-        ii, jj, dd = hamming_pairs(hashes, max(o.max_bits, PIXEL_CANDIDATE_BITS))
+        ii, jj, dd = hamming_pairs(hashes, max(o.max_bits, PIXEL_CANDIDATE_BITS), **self.hp("photos"))
         need, pixel_pairs = set(), []
-        for i, j, d in zip(ii, jj, dd):
+        for i, j, d in zip(ii.tolist(), jj.tolist(), dd.tolist()):
             a, b = photos[i], photos[j]
             if (d <= PIXEL_CANDIDATE_BITS and a.meta.get("w") == b.meta.get("w")
                     and a.meta.get("h") == b.meta.get("h")
@@ -1581,8 +1634,8 @@ class Matcher:
                 if idx not in flat:
                     owners.append(r)
                     hashes.append(h)
-        ii, jj, _ = hamming_pairs(hashes, o.max_bits)
-        cands = {(owners[i].fid, owners[j].fid) for i, j in zip(ii, jj)
+        ii, jj, _ = hamming_pairs(hashes, o.max_bits, **self.hp("scanned PDF pages"))
+        cands = {(owners[i].fid, owners[j].fid) for i, j in zip(ii.tolist(), jj.tolist())
                  if owners[i].fid != owners[j].fid}
         for a, b in {(min(p), max(p)) for p in cands}:
             s = pdf_visual_score(self.recs[a], self.recs[b], o.max_bits)
@@ -1602,8 +1655,9 @@ class Matcher:
                     owners.append(r)
                     pages.append(idx)
                     hashes.append(h)
-        ii, jj, dd = hamming_pairs([p.phash for p in photos], o.max_bits, hashes)
-        for i, j, d in zip(ii, jj, dd):
+        ii, jj, dd = hamming_pairs([p.phash for p in photos], o.max_bits, hashes,
+                                   **self.hp("photos against PDF pages"))
+        for i, j, d in zip(ii.tolist(), jj.tolist(), dd.tolist()):
             self.add(photos[i].fid, owners[j].fid, "related", visual_score(d), page=pages[j] + 1)
 
     # -- optional AI similarity -----------------------------------------
@@ -1650,7 +1704,7 @@ class UnionFind:
             self.parent[max(ra, rb)] = min(ra, rb)
 
 
-@dataclass
+@dataclass(slots=True)
 class Member:
     fid: int
     keeper: bool = False
@@ -2304,8 +2358,8 @@ def make_thumbnail(rec: FileRec, thumbs_dir: str, size: int = 256) -> str | None
 
 
 def make_crop(rec: FileRec, which: str) -> bytes | None:
-    tiles = rec.meta.get("tiles") or []
-    if rec.kind != "image" or len(tiles) != 16:
+    tiles = rec.meta.get("tiles")
+    if rec.kind != "image" or tiles is None or len(tiles) != 16:
         return None
     idx = int(np.argmax(tiles) if which == "sharp" else np.argmin(tiles))
     im, _ = load_photo(rec.path, None)
@@ -2412,7 +2466,7 @@ def apply_result(rec: FileRec, res: dict):
     rec.camera = res.get("camera")
     rec.sharpness = res.get("sharpness")
     rec.exposure = res.get("exposure")
-    rec.meta = res.get("meta") or {}
+    rec.meta = compact_meta(res.get("meta") or {})
 
 
 def cached_analysis_usable(rec: FileRec, row: dict, opts) -> bool:
@@ -2500,7 +2554,7 @@ def run_scan(opts, cache: Cache, show_progress: bool = True) -> ScanResult:
         if opts.ai:
             compute_embeddings(recs, opts, cache, scan_id, prog)
         prog.done("Matching and grouping...")
-        matcher = Matcher(recs, opts, compute)
+        matcher = Matcher(recs, opts, compute, prog.update)
         links = matcher.match_all()
         grouper = Grouper(recs, matcher, opts)
         groups = grouper.build(links)
@@ -2627,7 +2681,7 @@ def member_dict(rec: FileRec, m: Member, g: Group, opts, mode: str, thumbs: dict
         "exposure": exposure_text(rec, opts) if rec.kind == "image" else None,
         "flags": m.flags, "locked": m.locked, "lock_reason": m.lock_reason,
         "thumb": None, "file_url": None, "folder_url": None,
-        "crops": mode == "server" and len(rec.meta.get("tiles") or []) == 16,
+        "crops": mode == "server" and len(rec.meta.get("tiles", ())) == 16,
     }
     if rec.error:
         d["detail"] = (d["detail"] + "; " if d["detail"] else "") + f"Couldn't read: {rec.error}"
