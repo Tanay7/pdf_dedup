@@ -1,0 +1,7 @@
+# Runtime packages for dupefinder.py. install.bat installs these offline from
+# the wheels\ folder of the DupeFinder zip; nothing is downloaded.
+numpy==2.5.3
+pillow==12.3.0
+pillow-heif==1.8.1
+PyMuPDF==1.28.2
+Send2Trash==2.1.0

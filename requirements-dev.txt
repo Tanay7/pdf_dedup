@@ -1,0 +1,2 @@
+# Only needed to run the tests (not part of the offline zip).
+pytest>=8
