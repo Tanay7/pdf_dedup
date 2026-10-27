@@ -1,8 +1,31 @@
-# Build notes (work paused before coding)
+# Build notes
 
-Status: planning finished, **no code written yet**. The design in
-[design.md](design.md) is the spec; this file records the decisions made
-while planning, so the build can resume without redoing them.
+Status: **built**. `dupefinder.py` implements build steps 1–11 of
+[design.md](design.md), and the tests cover the design's test plan
+(`python -m pytest -q`). This file records the decisions made beyond the
+design.
+
+## As built (differences from the plan below)
+
+- **PyMuPDF version:** pinned to **1.28.2**, not 2.0. The 2.0 wheel bundles
+  about 40 MB of AI layout models that DupeFinder doesn't use. The offline
+  zip holds wheels for Python 3.12, 3.13 and 3.14 and comes to **94 MB**
+  (any one Python version uses about 45 MB of it).
+- **Default `--blur-cutoff`:** **40**. On the generated test photos, blurry
+  measures about 3, motion-blurred frames about 25, and sharp photos 160 or
+  more. Real skies and smooth scenes score lower than test patterns, so the
+  cutoff is kept cautious, and the report shows the scan's sharpness
+  percentiles to help tune it.
+- **Worker errors:** a crash or "stopped unexpectedly" error is not kept in
+  the cache; that file is retried on the next scan. If workers can't finish
+  a single file, the scan stops with a clear message.
+- **Report page:** embedded in the script as `REPORT_TEMPLATE`. It has a CSP
+  header (server mode) or meta tag (static mode) that blocks every non-local
+  load. `dev/check_report.js` tests it in Chromium against
+  `dev/sample_data.json`.
+- **Keep rules:** for the scanned-PDF pair in the tests, the design's rule
+  keeps the newer, recompressed copy. `--keep largest` keeps the
+  higher-quality scan instead.
 
 ## Deliverable shape
 
