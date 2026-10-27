@@ -16,6 +16,7 @@ def pytest_configure(config):
     # Windows keeps temp files under AppData, which DupeFinder treats as a
     # system folder (never pre-selected), so test files go somewhere else.
     if os.name == "nt" and not config.option.basetemp:
+        (ROOT / "build").mkdir(exist_ok=True)
         config.option.basetemp = str(ROOT / "build" / "pytest-tmp")
 
 
