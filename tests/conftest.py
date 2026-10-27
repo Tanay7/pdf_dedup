@@ -12,6 +12,13 @@ import dupefinder as df  # noqa: E402
 import make_test_files as gen  # noqa: E402
 
 
+def pytest_configure(config):
+    # Windows keeps temp files under AppData, which DupeFinder treats as a
+    # system folder (never pre-selected), so test files go somewhere else.
+    if os.name == "nt" and not config.option.basetemp:
+        config.option.basetemp = str(ROOT / "build" / "pytest-tmp")
+
+
 def fake_attributes(entry, st):
     """Pretend files named online_only* are OneDrive online-only placeholders."""
     if entry.name.startswith("online_only"):

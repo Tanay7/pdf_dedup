@@ -29,7 +29,7 @@ def served(dataset, tmp_path, monkeypatch):
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(root / rel, dest)
     # Review folders go to the test folder, not the real drive root.
-    monkeypatch.setattr(df, "volume_root", lambda p: str(work))
+    monkeypatch.setattr(df, "review_root", lambda p: str(work))
     s = run(work, tmp_path / "cache")
     server = df.ReportServer(s.result, s.cache)
     server.start()

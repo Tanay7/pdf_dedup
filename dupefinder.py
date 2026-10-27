@@ -2134,8 +2134,13 @@ def trash_file(path: str):
     send2trash(path)
 
 
+def review_root(path: str) -> str:
+    """Where a drive's _duplicates_review folder lives. Tests replace this."""
+    return volume_root(path)
+
+
 def review_destination(path: str) -> str:
-    root = volume_root(path)
+    root = review_root(path)
     rel = os.path.relpath(os.path.abspath(path), root)
     dest = os.path.join(root, REVIEW_DIR, rel)
     base, ext = os.path.splitext(dest)
