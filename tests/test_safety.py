@@ -266,3 +266,76 @@ def test_windows_system_folders():
     assert df.system_folder_reason("C:\\Users\\Tan\\AppData", "AppData", "C:\\Users\\Tan")
     assert not df.system_folder_reason("D:\\Photos\\Windows", "Windows", "D:\\Photos")
     assert df.drive_kind("C:\\") == "fixed"
+
+
+# -- regressions from the code review ------------------------------------------------------
+
+def test_burst_keeper_is_a_frame_not_a_smaller_export(dataset, tmp_path):
+    root, _ = dataset
+    work = tmp_path / "b"
+    shutil.copytree(root / "photos" / "burst", work)
+    from PIL import Image, ImageFilter
+    im = Image.open(work / "burst_3.jpg")
+    im.resize((1200, 900)).filter(ImageFilter.SHARPEN).save(work / "export.jpg")   # no EXIF
+    s = run(work, tmp_path / "c", "--types", "image")
+    assert s.member("burst_3.jpg").keeper
+    assert s.member("export.jpg").suggest == "trash"
+
+
+def test_pdf_with_extra_scanned_page_not_preselected(dataset, tmp_path):
+    import pymupdf
+    root, _ = dataset
+    work = tmp_path / "p"
+    work.mkdir()
+    shutil.copy(root / "pdf/report.pdf", work / "contract.pdf")
+    doc = pymupdf.open(root / "pdf/report.pdf")
+    page = doc.new_page()
+    page.insert_image(page.rect, filename=str(root / "photos/scan_page.jpg"))
+    doc.save(work / "contract_signed.pdf")
+    os.utime(work / "contract_signed.pdf", (1_000_000_000, 1_000_000_000))  # older: not the keeper
+    s = run(work, tmp_path / "c", "--types", "pdf")
+    assert s.member("contract.pdf").keeper
+    m = s.member("contract_signed.pdf")
+    assert m.suggest == "keep" and "pages" in m.detail
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="needs a non-UTF-8 file name")
+def test_undecodable_file_name_does_not_stop_the_scan(dataset, tmp_path):
+    root, _ = dataset
+    work = tmp_path / "n"
+    work.mkdir()
+    shutil.copy(root / "photos/beach.jpg", work / "beach.jpg")
+    shutil.copy(root / "photos/beach.jpg", os.fsencode(str(work)) + b"/caf\xe9.jpg")
+    s = run(work, tmp_path / "c", "--types", "image")
+    assert any("can't be read" in e for _, e in s.result.stats.errors)
+    assert "beach.jpg" in s.by_rel
+
+
+def test_undo_review_twice(served, monkeypatch):
+    s, server = served
+    monkeypatch.setattr(df, "drive_kind", lambda p: "removable")
+    rel = "pdf/archive/report renamed.pdf"
+    path, fid = s.rec(rel).path, s.rec(rel).fid
+    assert move(server, [fid])[fid]["ok"]
+    assert df.undo_review(s.cache) == 0 and os.path.exists(path)
+    server.mover.moved.clear()                 # same file chosen again in a later session
+    assert move(server, [fid])[fid]["ok"]
+    assert df.undo_review(s.cache) == 0 and os.path.exists(path)
+
+
+def test_kept_copy_deleted_outside_the_tool(served):
+    s, server = served
+    g = s.group("pdf/report.pdf")
+    keeper = next(m for m in g.members if m.keeper)
+    other = next(m for m in g.members if not m.keeper)
+    os.remove(s.result.recs[keeper.fid].path)
+    res = move(server, [other.fid])[other.fid]
+    assert not res["ok"] and "no copy" in res["reason"]
+
+
+def test_guard_disables_proxies():
+    import urllib.request
+    df.install_network_guard()
+    assert urllib.request.getproxies() == {}
+    with pytest.raises(OSError):
+        socket.gethostbyname("example.com")

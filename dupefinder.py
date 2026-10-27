@@ -176,10 +176,33 @@ def install_network_guard() -> None:
                 f"{APP_NAME} works offline and blocked a lookup of {host}")
         return real_getaddrinfo(host, *args, **kwargs)
 
+    def guard_lookup(name):
+        real = getattr(socket, name)
+
+        def lookup(host, *args, **kwargs):
+            target = host[0] if isinstance(host, tuple) else host
+            if not _is_loopback_host(target):
+                raise socket.gaierror(f"{APP_NAME} works offline and blocked a lookup of {target}")
+            return real(host, *args, **kwargs)
+        setattr(socket, name, lookup)
+
+    real_sendto = socket.socket.sendto
+
+    def sendto(self, data, *args):
+        check(self, args[-1])
+        return real_sendto(self, data, *args)
+
     socket.socket.connect = connect
     socket.socket.connect_ex = connect_ex
+    socket.socket.sendto = sendto
     socket.getaddrinfo = getaddrinfo
+    for name in ("gethostbyname", "gethostbyname_ex", "gethostbyaddr", "getnameinfo"):
+        guard_lookup(name)
     socket._dupefinder_guard = True
+    # A local proxy (system or environment setting) must not relay anything out.
+    os.environ["NO_PROXY"] = os.environ["no_proxy"] = "*"
+    import urllib.request
+    urllib.request.getproxies = lambda: {}
     # Belt and braces for optional AI libraries: never fetch model weights.
     for var in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE"):
         os.environ.setdefault(var, "1")
@@ -477,6 +500,7 @@ class Walker:
         self.exclude_keys = [path_key(p) for p in opts.exclude]
         self.own_keys = [path_key(p) for p in own_dirs]
         self.seen_ids: set = set()
+        self.listed: set = set()      # folders read completely this run
 
     def walk(self, roots: list[str]):
         for root in roots:
@@ -499,6 +523,7 @@ class Walker:
                 log.info("Skipped %s: %s", folder, e)
                 continue
             subdirs = []
+            complete = True
             with it:
                 while True:
                     try:
@@ -507,16 +532,25 @@ class Walker:
                         break
                     except OSError as e:
                         self.stats.denied.append((folder, e.strerror or str(e)))
+                        complete = False
                         break
                     rec = self._visit(folder, entry, in_system, subdirs)
                     if rec is not None:
                         yield rec
+            if complete:
+                self.listed.add(path_key(folder))
             # Reverse so folders are visited in name order.
             stack.extend(reversed(sorted(subdirs)))
 
     def _visit(self, folder, entry, in_system, subdirs):
         name = entry.name
         full = os.path.join(folder, name)
+        try:
+            full.encode("utf-8")
+        except UnicodeEncodeError:
+            self.stats.errors.append((full.encode("utf-8", "replace").decode("utf-8"),
+                                      "Name can't be read as text; skipped"))
+            return None
         try:
             if entry.is_symlink() or entry_is_junction(entry):
                 self.stats.links += 1
@@ -681,14 +715,18 @@ class Cache:
                                 [(scan_id, p) for p in paths])
             self.db.commit()
 
-    def forget_missing(self, roots: list[str], kinds: set[str], scan_id: int) -> int:
-        """Delete rows for files not found during this full scan of their folder."""
-        keys = [path_key(r) for r in roots]
+    def forget_missing(self, listed: set, kinds: set[str], scan_id: int) -> int:
+        """Delete rows for files not found during this full scan of their folder.
+
+        `listed` holds the path keys of folders read completely this run, so
+        excluded, skipped or unreadable folders keep their cached rows.
+        """
         with self.lock:
             rows = self.db.execute(
                 "SELECT path, kind FROM files WHERE last_scan IS NULL OR last_scan != ?",
                 (scan_id,)).fetchall()
-            gone = [p for p, k in rows if k in kinds and any(is_under(p, key) for key in keys)]
+            gone = [p for p, k in rows
+                    if k in kinds and path_key(os.path.dirname(p)) in listed]
             self.db.executemany("DELETE FROM files WHERE path=?", [(p,) for p in gone])
             self.db.commit()
         return len(gone)
@@ -1440,6 +1478,17 @@ def pdf_visual_score(a: FileRec, b: FileRec, max_bits: int) -> float:
     return min(side(d.min(axis=1)), side(d.min(axis=0)))
 
 
+def pdf_has_extra_pages(r: FileRec, k: FileRec, max_bits: int) -> bool:
+    """True if PDF r has more pages than k, or image-only pages k lacks."""
+    if (r.meta.get("pages") or 0) > (k.meta.get("pages") or 0):
+        return True
+    flat = set(r.meta.get("flat_pages") or [])
+    mine = [h for idx, h in zip(r.meta.get("hashed_pages") or [], r.page_hashes or [])
+            if idx not in flat]
+    theirs = list(k.page_hashes or [])
+    return any(all(hamming(h, t) > max_bits for t in theirs) for h in mine)
+
+
 @dataclass(slots=True)
 class Link:
     a: int
@@ -1853,7 +1902,11 @@ class Grouper:
         elif rule == "shortest-path":
             key = lambda r: (len(r.path), r.path)
         elif pool[0].kind == "image":
-            if any(r.fid in self.m.burst_chain for r in pool):
+            frames = [r for r in pool if r.fid in self.m.burst_chain]
+            if frames:
+                # Only burst frames compete on sharpness; a smaller export or
+                # copy of a frame must never outrank the full-size originals.
+                pool = frames
                 key = lambda r: (-quality_score(r, o), -r.pixels, r.path)
             else:
                 key = lambda r: (-r.pixels, -r.size, has_copy_marker(r.path),
@@ -1965,6 +2018,9 @@ class Grouper:
                     m.label = link_label(kind, score, extra, shots)
                     if kind in PRESELECT_KINDS:
                         m.suggest = "trash"
+                    if r.kind == "pdf" and kind != "identical" and pdf_has_extra_pages(r, k, o.max_bits):
+                        m.suggest = "keep"
+                        m.detail = "Has pages the kept copy doesn't, so it isn't pre-selected"
                 else:
                     via, ln = parent.get(f) or (None, None)
                     m.label_kind, m.score = "via", None
@@ -2064,6 +2120,16 @@ WINDOWS_DRIVE_TYPES = {0: "unknown", 1: "unknown", 2: "removable", 3: "fixed",
 def volume_root(path: str) -> str:
     path = os.path.abspath(path)
     if IS_WINDOWS:
+        import ctypes
+        buf = ctypes.create_unicode_buffer(32768)
+        if ctypes.windll.kernel32.GetVolumePathNameW(ctypes.c_wchar_p(to_extended_path(path)),
+                                                      buf, 32768):
+            root = buf.value
+            if root.startswith("\\\\?\\UNC\\"):
+                root = "\\\\" + root[8:]
+            elif root.startswith("\\\\?\\"):
+                root = root[4:]
+            return root if root.endswith("\\") else root + "\\"
         drive, _ = os.path.splitdrive(path)
         return drive.rstrip("\\") + "\\"
     p = path
@@ -2193,7 +2259,8 @@ class Mover:
             g = self.r.group_by_id[gid]
             if g.type == "poor":
                 continue
-            left = [m.fid for m in g.members if m.fid not in self.moved and m.fid not in chosen]
+            left = [m.fid for m in g.members if m.fid not in self.moved
+                    and m.fid not in chosen and self._unchanged(recs[m.fid])]
             if not left:
                 blocked |= chosen
         for f in todo:
@@ -2211,6 +2278,14 @@ class Mover:
         except OSError as e:
             log.warning("Couldn't write actions.csv: %s", e)
         return results
+
+    @staticmethod
+    def _unchanged(rec: FileRec) -> bool:
+        try:
+            st = os.stat(io_path(rec.path))
+        except OSError:
+            return False
+        return st.st_size == rec.size and st.st_mtime_ns == rec.mtime_ns
 
     def _move_one(self, rec: FileRec, g: Group) -> dict:
         try:
@@ -2255,13 +2330,14 @@ class Mover:
 def undo_review(cache: Cache) -> int:
     """Move files from _duplicates_review folders back, using the action log."""
     acts = cache.actions()
-    restored = {path_key(a["destination"]) for a in acts if a["action"] == "restore" and a["destination"]}
+    restored = {int(a["note"][5:]) for a in acts
+                if a["action"] == "restore" and (a["note"] or "").startswith("undo:")}
     done = problems = 0
     for a in acts:
         if a["action"] != "review" or not a["destination"]:
             continue
         src, orig = a["destination"], a["path"]
-        if path_key(src) in restored:
+        if a["id"] in restored:
             continue
         if not os.path.lexists(io_path(src)):
             print(f"  Not found (already moved back?): {src}")
@@ -2279,7 +2355,7 @@ def undo_review(cache: Cache) -> int:
             problems += 1
             continue
         cache.log_action(a["scan_id"], orig, "restore", src, a["group_id"], a["kept_path"],
-                         a["file_sha256"], a["size"], "undo-review")
+                         a["file_sha256"], a["size"], f"undo:{a['id']}")
         _prune_empty_dirs(os.path.dirname(src))
         done += 1
     cache.export_actions()
@@ -2493,7 +2569,7 @@ def run_scan(opts, cache: Cache, show_progress: bool = True) -> ScanResult:
     prog = Progress(show_progress)
     scan_id = cache.start_scan(opts.roots, {k: v for k, v in vars(opts).items()
                                             if k not in ("type_set",)})
-    walker = Walker(opts, stats, own_dirs=[cache.dir])
+    walker = Walker(opts, stats, own_dirs=[normalize_root(cache.dir)])
     recs: list[FileRec] = []
     try:
         for rec in walker.walk(opts.roots):
@@ -2573,7 +2649,7 @@ def run_scan(opts, cache: Cache, show_progress: bool = True) -> ScanResult:
             log.warning("Couldn't read %s: %s", r.path, r.error)
         if r.meta.get("encrypted"):
             stats.protected.append(r.path)
-    cache.forget_missing(opts.roots, opts.type_set, scan_id)
+    cache.forget_missing(walker.listed, opts.type_set, scan_id)
     stats.finished = time.time()
     result = ScanResult(recs=recs, groups=groups, stats=stats, scan_id=scan_id,
                         opts=opts, roots=opts.roots, matcher=matcher, grouper=grouper)
@@ -2632,6 +2708,14 @@ def load_embedder(opts):
 
 
 def compute_embeddings(recs, opts, cache, scan_id, prog):
+    try:
+        size = os.path.getsize(opts.ai_model)
+    except OSError:
+        size = 0
+    model_id = f"{opts.ai_arch}|{os.path.basename(opts.ai_model)}|{size}"
+    for r in recs:
+        if r.embedding is not None and r.meta.get("ai_model") != model_id:
+            r.embedding = None          # made by another model: not comparable
     todo = [r for r in recs if r.kind == "image" and r.embedding is None and not r.error]
     if not todo:
         return
@@ -2656,6 +2740,7 @@ def compute_embeddings(recs, opts, cache, scan_id, prog):
                 vecs = embed([im for _, im in pairs])
                 for (r, _), v in zip(pairs, vecs):
                     r.embedding = np.asarray(v, dtype=np.float32)
+                    r.meta["ai_model"] = model_id
                 cache.save([r for r, _ in pairs], scan_id)
             done += len(todo[i:i + 32])
             prog.update(f"AI similarity: {done:,} of {len(todo):,} photos")
@@ -2670,7 +2755,10 @@ def member_dict(rec: FileRec, m: Member, g: Group, opts, mode: str, thumbs: dict
     if rec.kind == "image" and rec.meta.get("taken"):
         date, date_kind = rec.meta["taken"], "taken"
     else:
-        date = dt.datetime.fromtimestamp(rec.mtime_ns / 1e9).strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            date = dt.datetime.fromtimestamp(rec.mtime_ns / 1e9).strftime("%Y-%m-%d %H:%M:%S")
+        except (OSError, OverflowError, ValueError):
+            date = "unknown"
         date_kind = "modified"
     dims = (f"{rec.meta['w']} × {rec.meta['h']}"
             if rec.kind == "image" and rec.meta.get("w") else None)
@@ -3112,8 +3200,8 @@ def parse_args(argv=None):
         if not any(is_under(r, path_key(x)) for x in kept):
             kept.append(r)
     opts.roots = kept
-    opts.exclude = [os.path.abspath(x) for x in opts.exclude]
-    opts.prefer = [os.path.abspath(x) for x in opts.prefer]
+    opts.exclude = [normalize_root(x) for x in opts.exclude]
+    opts.prefer = [normalize_root(x) for x in opts.prefer]
     opts.workers = max(1, opts.workers)
     if not opts.ai_model:
         opts.ai_model = os.path.join(opts.cache, "models", "clip.pt")
@@ -3211,7 +3299,8 @@ def main(argv=None) -> int:
             pass
         finally:
             server.stop()
-            path = cache.export_actions()
+            with server.mover.lock:        # let a running move batch finish logging
+                path = cache.export_actions()
             if server.mover.moved:
                 print(f"\nMoved {len(server.mover.moved)} file(s). Log of every move: {path}")
         return 0
