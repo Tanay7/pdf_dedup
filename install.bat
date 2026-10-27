@@ -2,20 +2,24 @@
 rem Installs the packages DupeFinder needs from the wheels folder. Works offline.
 setlocal
 cd /d "%~dp0"
+rem The wheels folder holds packages for 64-bit Python 3.12, 3.13 and 3.14.
+set "CHECK=import sys, struct; ok = (3, 12) <= sys.version_info[:2] <= (3, 14) and struct.calcsize('P') == 8 and getattr(sys, '_is_gil_enabled', lambda: True)(); sys.exit(0 if ok else 1)"
 set "PY="
-where py >nul 2>nul && set "PY=py -3"
-if not defined PY where python >nul 2>nul && set "PY=python"
-if not defined PY (
-  echo Python 3.12 or newer is needed. Install it from python.org, then run this again.
-  goto :fail
+for %%V in (3.13 3.12 3.14) do (
+  if not defined PY (
+    py -%%V -c "%CHECK%" >nul 2>nul && set "PY=py -%%V"
+  )
 )
-%PY% -c "import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)"
-if errorlevel 1 (
-  echo DupeFinder needs Python 3.12 or newer.
+if not defined PY (
+  python -c "%CHECK%" >nul 2>nul && set "PY=python"
+)
+if not defined PY (
+  echo DupeFinder needs 64-bit Python 3.12, 3.13 or 3.14. Install one from python.org,
+  echo then run install.bat again.
   goto :fail
 )
 if not exist ".venv\Scripts\python.exe" (
-  echo Creating a private Python environment in .venv ...
+  echo Creating a private Python environment in .venv with %PY% ...
   %PY% -m venv .venv
   if errorlevel 1 goto :fail
 )
