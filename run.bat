@@ -8,7 +8,9 @@ set "PY="
 if exist "python\python.exe" set "PY=python\python.exe"
 if not defined PY if exist ".venv\Scripts\python.exe" set "PY=.venv\Scripts\python.exe"
 if not defined PY (
-  echo The python folder is missing. Unzip the whole DupeFinder download and run this again.
+  echo This folder has no python folder, so it is the source code or an incomplete unzip.
+  echo Download the ready-to-run version: GitHub, Actions tab, latest green run,
+  echo Artifacts: DupeFinder-windows. Unzip it fully, then double-click run.bat.
   pause
   exit /b 1
 )
