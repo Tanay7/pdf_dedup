@@ -43,15 +43,24 @@ results in a browser report and move the extra copies to the Recycle Bin.
 The full design, scoring rules and test plan are in [docs/design.md](docs/design.md).
 Decisions made while building it are in [docs/BUILD_NOTES.md](docs/BUILD_NOTES.md).
 
-## Install (offline zip, Windows 10/11)
+## Install (Windows 10/11, nothing else needed)
 
-1. Install **Python 3.12 or newer (64-bit)** from python.org if you don't have it.
-2. Download `DupeFinder-<version>-windows-offline.zip` from the repository's
+1. Download `DupeFinder-<version>-windows.zip` from the repository's
    **Releases** page or from the latest **Actions** run (artifact
-   *DupeFinder-windows-offline*), and unzip it anywhere.
-3. Double-click **`install.bat`**. It creates a private `.venv` folder and
-   installs the packages from the zip's `wheels` folder, without connecting to
-   the internet.
+   *DupeFinder-windows*).
+2. Unzip it anywhere, for example to `C:\Tools\DupeFinder`. GitHub's Actions
+   download is a zip around the zip; unzip both.
+3. Double-click **`run.bat`**.
+
+The zip carries its own private copy of Python with every package
+pre-installed, in the `python` folder. You don't need Python on your PC, and
+nothing is downloaded or installed. If Windows shows "Windows protected your
+PC" the first time, click **More info**, then **Run anyway**. That warning
+appears for any batch file downloaded from the internet.
+
+People who prefer their own Python 3.12–3.14 can build the smaller
+`-windows-wheels.zip` with `python tools/build_offline_zip.py` and run its
+`install.bat`.
 
 ## Use
 
@@ -186,12 +195,12 @@ python -m pip install -r requirements.txt -r requirements-dev.txt
 python -m pytest -q                      # the design's test plan on generated files
 python tests/make_test_files.py OUT      # just build the test folder (add --check)
 node dev/check_report.js                 # browser checks of the report page (Playwright)
-python tools/build_offline_zip.py        # build the offline Windows zip into dist/
+python tools/build_offline_zip.py --portable C:\\Python313   # portable Windows zip (run on Windows)
 ```
 
 GitHub Actions runs the tests on Windows (Python 3.12–3.14) and Linux. It then
-builds the offline zip, installs it with no package index on Windows, and scans
-the generated test files with it. Pushing a `v*` tag attaches the zip to a
+builds the portable zip, unzips it on Windows with no other Python available,
+and scans the generated test files with only what is inside. Pushing a `v*` tag attaches the zip to a
 release.
 
 ## Notes

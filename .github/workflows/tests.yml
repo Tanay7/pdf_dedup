@@ -39,26 +39,27 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-      - name: Build the zip (downloads wheels; the only online step)
-        run: python tools/build_offline_zip.py --out dist
-      - name: Install from the zip with no package index, then scan the test files
+      - name: Build the portable zip (Python and packages inside; the only online step)
+        run: python tools/build_offline_zip.py --portable "$env:pythonLocation" --out dist
+      - name: Unzip it and scan the test files with only what is inside
         shell: pwsh
         run: |
           $zip = Get-ChildItem dist\*.zip | Select-Object -First 1
           Expand-Archive $zip.FullName -DestinationPath "$env:RUNNER_TEMP\bundle"
           $dir = Get-ChildItem "$env:RUNNER_TEMP\bundle" -Directory | Select-Object -First 1
-          $env:DUPEFINDER_NO_PAUSE = "1"
+          $py = Join-Path $dir.FullName "python\python.exe"
+          $env:PATH = "C:\Windows\System32;C:\Windows"
+          $env:PYTHONHOME = ""; $env:PYTHONPATH = ""
           Push-Location $dir.FullName
-          cmd /c install.bat
-          if ($LASTEXITCODE -ne 0) { throw "install.bat failed" }
-          $py = Join-Path $dir.FullName ".venv\Scripts\python.exe"
+          & $py -c "import sys, numpy, PIL, pillow_heif, pymupdf, send2trash, tkinter; print(sys.executable)"
+          if ($LASTEXITCODE -ne 0) { throw "bundled Python is missing packages" }
           & $py "$env:GITHUB_WORKSPACE\tests\make_test_files.py" "$env:RUNNER_TEMP\testset"
           & $py dupefinder.py "$env:RUNNER_TEMP\testset" --report-only --no-browser --cache "$env:RUNNER_TEMP\cache"
-          if ($LASTEXITCODE -ne 0) { throw "scan from the installed bundle failed" }
+          if ($LASTEXITCODE -ne 0) { throw "scan with the bundled Python failed" }
           Pop-Location
       - uses: actions/upload-artifact@v4
         with:
-          name: DupeFinder-windows-offline
+          name: DupeFinder-windows
           path: dist/*.zip
           if-no-files-found: error
 
@@ -72,8 +73,8 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: DupeFinder-windows-offline
+          name: DupeFinder-windows
           path: dist
       - env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${{ github.ref_name }}" dist/*.zip --repo "${{ github.repository }}" --title "DupeFinder ${{ github.ref_name }}" --notes "Offline Windows bundle. Unzip, run install.bat, then run.bat."
+        run: gh release create "${{ github.ref_name }}" dist/*.zip --repo "${{ github.repository }}" --title "DupeFinder ${{ github.ref_name }}" --notes "Offline Windows bundle with its own Python. Unzip, then double-click run.bat."
