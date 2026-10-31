@@ -27,6 +27,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
+      - name: Install Tesseract (Linux only; exercises --ocr)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -q && sudo apt-get install -y -q tesseract-ocr
       - run: python -m pip install -r requirements.txt -r requirements-dev.txt
       - run: python -m pytest -q -ra
 

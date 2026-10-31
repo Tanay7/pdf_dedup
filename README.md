@@ -125,9 +125,38 @@ and no move button.
 | 100% same text | Same words, different file (e.g. re-saved PDF) |
 | 100% same pixels | Same image, different metadata or format |
 | N% similar text | Share of 5-word chunks two PDFs have in common (shown from 85%) |
-| N% visual match | How alike two photos or scanned PDFs look (photos: at most 8 of 64 hash bits differ) |
+| N% visual match | How alike two photos or scanned PDFs look (photos: at most 8 of 64 hash bits differ). "(rotated)", "(mirrored)" or "(cropped)" marks a copy found in that form; mirrored and cropped ones are never pre-selected |
 | Burst · N shots | Same camera, taken seconds apart, looking alike |
 | Related | A photo matches a page inside a scanned PDF; never pre-selected |
+
+### How it decides
+
+- **Photos:** each photo gets a 64-bit perceptual hash, made from its
+  brightness pattern at 32×32. The same calculation also gives the hashes
+  of the photo turned 90°, 180° or 270° and mirrored, plus one hash of its
+  centre.
+
+  That finds the following, even after renaming, re-saving or a change of
+  format:
+  - resized and recompressed copies;
+  - copies rotated in their pixels;
+  - mirrored copies;
+  - square and centre crops.
+
+  The hash ignores colour, so a separate colour check stops photos with the
+  same layout but different colours from matching. Black-and-white versions
+  still match their colour originals.
+- **Blur:** a photo's sharpness score (0–100) comes from a published
+  "re-blur" measure (Crete et al., 2007). It is taken on the sharpest
+  quarter of the photo after filtering out sensor noise. So:
+  - a sharp subject on a soft background scores well;
+  - darkness doesn't count as blur;
+  - motion blur is caught;
+  - noisy night shots don't pass as sharp.
+
+  Below 45 counts as blurry.
+- **Tested on real photographs:** the test suite checks these behaviours
+  on real public-domain photos, not just generated ones.
 
 ### Keep rules (`--keep auto`)
 
@@ -154,7 +183,8 @@ only flagged as poor are never pre-selected for the Recycle Bin.
 | `--min-score` | 85 | Lowest % for text and scanned-PDF matches |
 | `--max-bits` | 8 | Most differing bits (of 64) for a photo visual match |
 | `--burst-gap` | 3 | Most seconds between shots in a burst |
-| `--blur-cutoff` | 40 | Sharpness below which a photo is flagged blurry; the report shows your photos' sharpness range to help tune it |
+| `--blur-cutoff` | 45 | Sharpness score (0–100) below which a photo is flagged blurry; the report shows your photos' range to help tune it |
+| `--quick` | off | Skip the search for turned, mirrored and cropped copies (faster on huge libraries) |
 | `--dark-cutoff` / `--clip-cutoff` | 40 / 25 | Exposure flags: median brightness, and the % of pixels near pure black or white |
 | `--ocr` | off | Read scanned PDFs with a locally installed Tesseract |
 | `--max-pages` | 30 | Pages rendered per scanned PDF |

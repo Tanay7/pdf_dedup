@@ -1,0 +1,7 @@
+Real photographs used by tests/test_real_photos.py, copied from scikit-image's
+bundled sample data (skimage.data), where they are listed as:
+
+astronaut.jpg  Eileen Collins, NASA; public domain
+coffee.jpg     Rachel Michetti; CC0
+chelsea.jpg    Stefan van der Walt; CC0
+rocket.jpg     SpaceX launch, public domain

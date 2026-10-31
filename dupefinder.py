@@ -69,7 +69,7 @@ IS_WINDOWS = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 
 # Raising this forces every cached fingerprint to be recomputed.
-ALGO_VERSION = 1
+ALGO_VERSION = 2
 
 PDF_EXTS = {".pdf"}
 RAW_EXTS = {".dng", ".cr2", ".cr3", ".crw", ".nef", ".nrw", ".arw", ".srf", ".sr2", ".orf",
@@ -92,7 +92,8 @@ MIN_SHINGLES = 5
 MINHASH_PERM = 128
 LSH_RECALL = 0.98
 REVIEW_DIR = "_duplicates_review"
-DEFAULT_BLUR_CUTOFF = 40.0   # tune on your own photos with --blur-cutoff
+DEFAULT_BLUR_CUTOFF = 45.0   # on the 0-100 sharpness score; tune with --blur-cutoff
+COLOUR_DIFF_CUT = 28.0       # chroma difference (0-255 scale) above which photos differ in colour
 WORKER_CRASH = "The worker process"   # errors starting with this are retried next scan
 IDLE_TIMEOUT = 30 * 60
 READ_CHUNK = 1 << 20
@@ -849,12 +850,33 @@ def phash_gray(gray) -> tuple[int, float]:
     Same algorithm as ImageHash's phash. Also returns the grey standard
     deviation of the 32x32 copy, used to spot flat (featureless) images.
     """
+    h, std, _ = phash_full(gray)
+    return h, std
+
+
+_SIGN8 = None
+
+
+def _bits64(block) -> int:
+    return int.from_bytes(np.packbits((block > np.median(block)).ravel()).tobytes(), "big")
+
+
+def phash_full(gray):
+    """pHash plus the hashes of the same image turned 90/180/270 degrees and mirrored.
+
+    A flip or 90-degree turn of an image only changes signs and swaps axes in
+    its DCT, so all variants come from one transform (no extra decoding).
+    """
+    global _SIGN8
+    if _SIGN8 is None:
+        _SIGN8 = (-1.0) ** np.arange(8)
     small = gray.resize((32, 32), Image.Resampling.LANCZOS)
     x = np.asarray(small, dtype=np.float64)
     c = _dct_matrix()
     low = (c @ x @ c.T)[:8, :8]
-    bits = (low > np.median(low)).ravel()
-    return int.from_bytes(np.packbits(bits).tobytes(), "big"), float(x.std())
+    sr, sc = _SIGN8[:, None], _SIGN8[None, :]
+    variants = [_bits64(low.T * sc), _bits64(low * sr * sc), _bits64(low.T * sr), _bits64(low * sc)]
+    return _bits64(low), float(x.std()), variants
 
 
 def hash_is_flat(h: int, std: float) -> bool:
@@ -1148,16 +1170,102 @@ def sharpness_tiles(a) -> tuple[float, list[float]]:
     return float(np.mean(sorted(tiles)[-4:])), tiles
 
 
+def noise_sigma(a) -> float:
+    """Immerkaer's fast estimate of the image noise standard deviation."""
+    if a.shape[0] < 3 or a.shape[1] < 3:
+        return 0.0
+    m = (a[:-2, :-2] - 2 * a[:-2, 1:-1] + a[:-2, 2:] - 2 * a[1:-1, :-2] + 4 * a[1:-1, 1:-1]
+         - 2 * a[1:-1, 2:] + a[2:, :-2] - 2 * a[2:, 1:-1] + a[2:, 2:])
+    return float(np.sqrt(np.pi / 2) * np.abs(m).sum() / (6 * (a.shape[1] - 2) * (a.shape[0] - 2)))
+
+
+def _box_blur(a, n: int, axis: int):
+    pad = [(n // 2, n // 2) if ax == axis else (0, 0) for ax in range(2)]
+    c = np.cumsum(np.pad(a, pad, mode="edge"), axis=axis, dtype=np.float64)
+    c = np.insert(c, 0, 0.0, axis=axis)
+    hi = np.take(c, np.arange(n, c.shape[axis]), axis=axis)
+    lo = np.take(c, np.arange(0, c.shape[axis] - n), axis=axis)
+    return (hi - lo) / n
+
+
+def reblur_blur(a) -> float:
+    """Crete et al. (2007) no-reference blur: 0 = sharp ... 1 = blurry.
+
+    Re-blurring a sharp image removes a lot of its variation; re-blurring a
+    blurry one changes little. Measured both ways, so motion blur counts too.
+    """
+    worst = 0.0
+    for axis in (0, 1):
+        if a.shape[axis] < 12:
+            continue
+        df_ = np.abs(np.diff(a, axis=axis))
+        db = np.abs(np.diff(_box_blur(a, 9, axis), axis=axis))
+        s_f = df_.sum()
+        if s_f <= 0:
+            return 1.0
+        worst = max(worst, float((s_f - np.maximum(0, df_ - db).sum()) / s_f))
+    return worst
+
+
+def blur_measures(gray):
+    """(score 0-100, detail sharpness, tiles).
+
+    The score is the re-blur measure on the 4 sharpest of 16 tiles of a
+    noise-filtered copy: noise looks like fine detail, so it is filtered first,
+    by an amount that depends on the measured noise level. Using the sharpest
+    tiles means a sharp subject on a soft background still scores well, and
+    the measure ignores darkness and low contrast. The detail sharpness
+    (Laplacian variance of the 4 sharpest tiles) ranks the frames of a burst.
+    """
+    from PIL import ImageFilter
+    raw = np.asarray(gray, dtype=np.float32)
+    # Frames of one burst share their noise, so they are ranked on the raw image.
+    lap, raw_tiles = sharpness_tiles(raw)
+    if not raw_tiles:
+        return 0.0, 0.0, []
+    sig = noise_sigma(raw)
+    if sig > 6:
+        gray = gray.filter(ImageFilter.MedianFilter(5))
+    elif sig > 2.5:
+        gray = gray.filter(ImageFilter.MedianFilter(3))
+    a = np.asarray(gray, dtype=np.float32)
+    _, tiles = sharpness_tiles(a)
+    hs, ws = (a.shape[0] - 2) // 4, (a.shape[1] - 2) // 4
+    top = np.argsort(tiles)[-4:]
+    blur = float(np.mean([reblur_blur(a[(t // 4) * hs:(t // 4 + 1) * hs + 2,
+                                        (t % 4) * ws:(t % 4 + 1) * ws + 2]) for t in top]))
+    return round((1 - blur) * 100, 1), round(lap, 2), raw_tiles
+
+
+def chroma_signature(im) -> list[float]:
+    """Average colour (YCbCr chroma) and how colourful the image is."""
+    ycc = np.asarray(_rgb_for_jpeg(im).convert("YCbCr"), dtype=np.float32)
+    cb, cr = ycc[..., 1], ycc[..., 2]
+    sat = float(np.mean(np.abs(cb - 128) + np.abs(cr - 128)))
+    return [round(float(cb.mean()), 1), round(float(cr.mean()), 1), round(sat, 1)]
+
+
+def centre_crop_hash(gray) -> int:
+    """pHash of the centre square (wide/tall photos) or the central 80% (squarish)."""
+    w, h = gray.size
+    if max(w, h) > 1.15 * min(w, h):
+        side = min(w, h)
+        box = ((w - side) // 2, (h - side) // 2, (w - side) // 2 + side, (h - side) // 2 + side)
+    else:
+        box = (w // 10, h // 10, w - w // 10, h - h // 10)
+    return phash_full(gray.crop(box))[0]
+
+
 def analyse_image(path: str) -> dict:
     im, info = load_photo(path, REDUCED_SIZE)
     gray = to_gray(im)
-    h, std = phash_gray(gray)
+    h, std, variants = phash_full(gray)
     a = np.asarray(gray, dtype=np.float32)
-    sharp, tiles = sharpness_tiles(a)
+    score, lap, tiles = blur_measures(gray)
     taken_at, taken_str, camera = exif_capture(info["exif"])
     return {
         "phash": h,
-        "sharpness": round(sharp, 3),
+        "sharpness": score,
         "exposure": {"median": float(np.median(a)),
                      "black": round(float((a <= 5).mean()), 4),
                      "white": round(float((a >= 250).mean()), 4)},
@@ -1165,7 +1273,8 @@ def analyse_image(path: str) -> dict:
         "camera": camera or None,
         "meta": {"w": info["w"], "h": info["h"], "format": info["format"],
                  "flat": hash_is_flat(h, std), "tiles": [round(t, 2) for t in tiles],
-                 "taken": taken_str},
+                 "taken": taken_str, "lap": lap, "phash_var": variants,
+                 "phash_crop": centre_crop_hash(gray), "chroma": chroma_signature(im)},
     }
 
 
@@ -1208,8 +1317,11 @@ def ocr_image(img, tesseract: str, lang: str, timeout: float) -> str:
     try:
         img.save(tmp)
         flags = subprocess.CREATE_NO_WINDOW if IS_WINDOWS else 0
+        # One thread per Tesseract: DupeFinder already runs one per worker, and
+        # Tesseract's own threads slow to a crawl when several copies compete.
+        env = dict(os.environ, OMP_THREAD_LIMIT="1")
         out = subprocess.run([tesseract, tmp, "stdout", "-l", lang], capture_output=True,
-                             timeout=timeout, creationflags=flags)
+                             timeout=timeout, creationflags=flags, env=env)
         return out.stdout.decode("utf-8", "replace")
     finally:
         try:
@@ -1595,6 +1707,36 @@ def pdf_has_extra_pages(r: FileRec, k: FileRec, max_bits: int) -> bool:
     return any(all(hamming(h, t) > max_bits for t in theirs) for h in mine)
 
 
+def colour_ok(a: FileRec, b: FileRec) -> bool:
+    """False when two photos clearly differ in colour (same layout, other colours).
+
+    Black-and-white or nearly colourless photos always pass, so a greyscale
+    conversion still matches its colour original.
+    """
+    ca, cb = a.meta.get("chroma"), b.meta.get("chroma")
+    if not ca or not cb or min(ca[2], cb[2]) < 6:
+        return True
+    return abs(ca[0] - cb[0]) + abs(ca[1] - cb[1]) <= COLOUR_DIFF_CUT
+
+
+VARIANT_NAMES = ("rotated", "rotated", "rotated", "mirrored")
+
+
+def variant_match(r: FileRec, k: FileRec):
+    """(bits, how) for the closest rotated, mirrored or cropped relation, or None."""
+    best = None
+    for name, h in zip(VARIANT_NAMES, k.meta.get("phash_var") or []):
+        d = hamming(r.phash, h)
+        if best is None or d < best[0]:
+            best = (d, name)
+    for x, y in ((r.phash, k.meta.get("phash_crop")), (k.phash, r.meta.get("phash_crop"))):
+        if x is not None and y is not None:
+            d = hamming(x, y)
+            if best is None or d < best[0]:
+                best = (d, "cropped")
+    return best
+
+
 @dataclass(slots=True)
 class Link:
     a: int
@@ -1683,13 +1825,35 @@ class Matcher:
                     and not (a.file_sha and a.file_sha == b.file_sha)):
                 pixel_pairs.append((a, b))
                 need.update(r.fid for r in (a, b) if not r.content_sha)
-            if d <= o.max_bits:
+            if d <= o.max_bits and colour_ok(a, b):
                 self.add(a.fid, b.fid, "visual", visual_score(d), bits=d)
+        if not o.quick:
+            self.match_photo_variants(photos)
         if need:
             self.compute("pixsha", sorted(need))
         for a, b in pixel_pairs:
             if a.content_sha and a.content_sha == b.content_sha:
                 self.add(a.fid, b.fid, "same_pixels", 100.0)
+
+    def match_photo_variants(self, photos):
+        """Copies turned or mirrored in their pixels (no rotation flag) and crops."""
+        o = self.opts
+        hashes = [r.phash for r in photos]
+        owners, names, extra = [], [], []
+        for i, r in enumerate(photos):
+            for name, h in zip(VARIANT_NAMES, r.meta.get("phash_var") or []):
+                owners.append(i)
+                names.append(name)
+                extra.append(h)
+            if r.meta.get("phash_crop") is not None:
+                owners.append(i)
+                names.append("cropped")
+                extra.append(r.meta["phash_crop"])
+        ii, jj, dd = hamming_pairs(hashes, o.max_bits, extra, **self.hp("turned, mirrored and cropped photos"))
+        for i, j, d in zip(ii.tolist(), jj.tolist(), dd.tolist()):
+            a, b = photos[i], photos[owners[j]]
+            if a is not b and colour_ok(a, b):
+                self.add(a.fid, b.fid, "visual", visual_score(d), bits=d, how=names[j])
 
     def match_bursts(self):
         """Chain shots from one camera taken within --burst-gap seconds that look alike."""
@@ -1903,7 +2067,8 @@ def link_label(kind: str, score: float | None, extra: dict | None = None, shots:
     if kind == "similar_text":
         return f"{math.floor(score)}% similar text"
     if kind == "visual":
-        return f"{score:.1f}".rstrip("0").rstrip(".") + "% visual match"
+        how = f" ({extra['how']})" if extra.get("how") else ""
+        return f"{score:.1f}".rstrip("0").rstrip(".") + f"% visual match{how}"
     if kind == "visual_pdf":
         return f"{math.floor(score)}% visual match"
     if kind == "burst":
@@ -1916,8 +2081,12 @@ def link_label(kind: str, score: float | None, extra: dict | None = None, shots:
     return kind
 
 
+def detail_sharpness(r: FileRec) -> float:
+    return float(r.meta.get("lap") or 0.0)
+
+
 def quality_score(r: FileRec, opts) -> float:
-    s = r.sharpness or 0.0
+    s = detail_sharpness(r)
     return s * 0.5 if exposure_flags(r, opts) else s
 
 
@@ -2073,10 +2242,14 @@ class Grouper:
             if chain is not None and chain == self.m.burst_chain.get(k.fid) \
                     and r.taken_at != k.taken_at:
                 return "burst", None, {}
-            if r.phash is not None and k.phash is not None and not r.flat and not k.flat:
+            if r.phash is not None and k.phash is not None and not r.flat and not k.flat \
+                    and colour_ok(r, k):
                 d = hamming(r.phash, k.phash)
                 if d <= o.max_bits:
                     return "visual", visual_score(d), {}
+                v = None if o.quick else variant_match(r, k)
+                if v and v[0] <= o.max_bits:
+                    return "visual", visual_score(v[0]), {"how": v[1]}
             if o.ai:
                 s = self.m.ai_similarity(r, k) * 100
                 if s >= o.ai_min_score:
@@ -2111,7 +2284,7 @@ class Grouper:
         burst_fids = [f for f in fids if f in self.m.burst_chain]
         is_burst = any(ln.kind == "burst" for f in fids for _, ln in adj[f])
         shots = len({(self.recs[f].camera, self.recs[f].taken_at) for f in burst_fids}) if is_burst else 0
-        top_sharp = max((self.recs[f].sharpness or 0) for f in burst_fids) if burst_fids else 0
+        top_sharp = max(detail_sharpness(self.recs[f]) for f in burst_fids) if burst_fids else 0
 
         members = []
         for f in fids:
@@ -2127,6 +2300,9 @@ class Grouper:
                     m.label = link_label(kind, score, extra, shots)
                     if kind in PRESELECT_KINDS:
                         m.suggest = "trash"
+                    if extra.get("how") in ("mirrored", "cropped"):
+                        m.suggest = "keep"
+                        m.detail = f"A {extra['how']} version may be a deliberate edit, so it isn't pre-selected"
                     if r.kind == "image" and is_raw(r.path) != is_raw(k.path):
                         m.suggest = "keep"
                         m.detail = "RAW and non-RAW versions of the same photo, so it isn't pre-selected"
@@ -2143,7 +2319,7 @@ class Grouper:
             if r.kind == "image":
                 in_burst = is_burst and f in self.m.burst_chain
                 if in_burst and top_sharp:
-                    m.rel_sharpness = round((r.sharpness or 0) / top_sharp * 100, 1)
+                    m.rel_sharpness = round(detail_sharpness(r) / top_sharp * 100, 1)
                 elif r.sharpness is not None and r.sharpness < o.blur_cutoff and not r.flat:
                     m.flags.append("blurry")
                 m.flags += exposure_flags(r, o)
@@ -3262,12 +3438,14 @@ def build_parser() -> argparse.ArgumentParser:
       help="most differing bits, out of 64, for a photo visual match (default: 8)")
     a("--burst-gap", type=float, default=3.0, help="most seconds between shots in a burst (default: 3)")
     a("--blur-cutoff", type=float, default=DEFAULT_BLUR_CUTOFF,
-      help=f"sharpness below which a single photo is flagged (default: {DEFAULT_BLUR_CUTOFF:g}); "
-           "the report shows your photos' sharpness range to help tune it")
+      help=f"sharpness score (0-100) below which a photo is flagged blurry "
+           f"(default: {DEFAULT_BLUR_CUTOFF:g}); the report shows your photos' range to help tune it")
     a("--dark-cutoff", type=float, default=40.0,
       help="median brightness (0-255) below which a photo is flagged dark (default: 40)")
     a("--clip-cutoff", type=float, default=25.0,
       help="%% of pixels near pure black or white above which a photo is flagged (default: 25)")
+    a("--quick", action="store_true",
+      help="skip the search for turned, mirrored and cropped photo copies (faster on huge libraries)")
     a("--ocr", action="store_true", help="read scanned PDFs with a locally installed Tesseract")
     a("--ocr-lang", default="eng", help="Tesseract language(s), e.g. eng+deu (default: eng)")
     a("--max-pages", type=int, default=30, help="pages rendered per scanned PDF (default: 30)")
@@ -3460,7 +3638,7 @@ def parse_args(argv=None):
     opts.workers = max(1, opts.workers)
     if not opts.ai_model:
         opts.ai_model = os.path.join(opts.cache, "models", "clip.pt")
-    opts.tesseract = None
+    opts.tesseract = find_tesseract() if opts.ocr else None
     return opts
 
 
@@ -3526,7 +3704,6 @@ def main(argv=None) -> int:
         if Image is not None:
             Image.MAX_IMAGE_PIXELS = 300_000_000
         if opts.ocr:
-            opts.tesseract = find_tesseract()
             if not opts.tesseract:
                 print("--ocr: Tesseract isn't installed, so scanned PDFs are compared by page images only.")
         print(f"{APP_NAME} {__version__}: scanning {', '.join(opts.roots)}")

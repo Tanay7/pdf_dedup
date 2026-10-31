@@ -1,6 +1,7 @@
 """The design's test plan, run on the generated test folder (tests/make_test_files.py)."""
 
 import os
+import shutil
 import time
 
 import pytest
@@ -287,3 +288,53 @@ def test_common_photo_formats_and_raw_preview(dataset, tmp_path):
     assert s.member("beach.dng").suggest == "keep" or s.member("beach.dng").keeper
     if not s.member("beach.dng").keeper:
         assert "RAW" in s.member("beach.dng").detail
+
+
+# -- optional extras: AI similarity (stand-in model) and OCR (needs Tesseract) -------------------
+
+def test_ai_similarity_plumbing(dataset, tmp_path, monkeypatch):
+    import numpy as np
+    root, _ = dataset
+    work = tmp_path / "ai"
+    work.mkdir()
+    for name in ("unrelated_1.jpg", "unrelated_3.jpg", "long_twin.jpg"):
+        shutil.copy(root / "photos" / name, work / name)
+    calls = []
+
+    def fake_loader(opts):
+        def embed(images):
+            calls.append(len(images))
+            return np.ones((len(images), 4), dtype=np.float32) / 2   # every photo "looks alike"
+        return embed
+    monkeypatch.setattr(df, "load_embedder", fake_loader)
+    s = run(work, tmp_path / "c", "--types", "image", "--ai")
+    assert sum(calls) == 3
+    g = s.group("unrelated_1.jpg")
+    assert g is not None and len(g.members) == 3
+    assert {m.label_kind for m in g.members if not m.keeper} == {"ai"}
+    assert all(r.meta.get("ai_model") for r in s.result.recs)
+    calls.clear()
+    run(work, tmp_path / "c", "--types", "image", "--ai")          # cached vectors reused
+    assert sum(calls) == 0
+
+
+def test_ocr_reads_scanned_pdfs(dataset, tmp_path):
+    import pymupdf
+    if not df.find_tesseract():
+        pytest.skip("Tesseract is not installed")
+    root, _ = dataset
+    work = tmp_path / "ocr"
+    work.mkdir()
+    src = pymupdf.open(root / "pdf/report.pdf")
+    for name, q in (("scan_a.pdf", 90), ("scan_b.pdf", 40)):
+        out = pymupdf.open()
+        for page in src.pages(0, 2):
+            pix = page.get_pixmap(dpi=150)
+            img = out.new_page(width=page.rect.width, height=page.rect.height)
+            img.insert_image(img.rect, stream=pix.tobytes("jpeg", jpg_quality=q))
+        out.save(work / name)
+    s = run(work, tmp_path / "c", "--types", "pdf", "--ocr")
+    a = s.rec("scan_a.pdf")
+    assert a.meta["scanned"] and a.meta["ocr"] and a.content_sha and a.minhash is not None
+    rel = s.relation("scan_b.pdf", "scan_a.pdf")
+    assert rel[0] in ("same_text", "similar_text", "visual_pdf") and rel[1] >= 85
