@@ -49,6 +49,7 @@ def test_image_only_pdf_and_recompressed_copy_match_visually(scan):
     kind, score, _ = scan.relation("pdf/scan_recompressed.pdf", "pdf/scan.pdf")
     assert kind == "visual_pdf" and score >= 85
     assert scan.same_group("pdf/scan.pdf", "pdf/scan_recompressed.pdf")
+    assert scan.member("pdf/scan.pdf").keeper   # the better-quality (bigger) scan is kept
 
 
 def test_resized_recompressed_photo_matches_90_or_more(scan):

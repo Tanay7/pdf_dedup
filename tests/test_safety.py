@@ -368,3 +368,54 @@ def test_folder_window(tmp_path):
         api["scan"]()
 
     assert df.pick_folders({"pdf", "image"}, on_ready=ready) == ([os.path.normpath(str(tmp_path))], {"pdf"})
+
+
+# -- hardening round 2 ------------------------------------------------------------------------
+
+def test_program_folders_are_skipped(dataset, tmp_path):
+    root, _ = dataset
+    work = tmp_path / "drive"
+    (work / "Photos").mkdir(parents=True)
+    (work / "Games" / "SomeGame" / "textures").mkdir(parents=True)
+    shutil.copy(root / "photos/beach.jpg", work / "Photos" / "beach.jpg")
+    (work / "Games" / "SomeGame" / "engine.dll").write_bytes(b"MZ fake dll")
+    shutil.copy(root / "photos/beach.jpg", work / "Games" / "SomeGame" / "textures" / "beach.jpg")
+    s = run(work, tmp_path / "c", "--types", "image")
+    assert list(s.by_rel) == ["Photos/beach.jpg"]
+    assert s.result.stats.program_skipped == 1
+    s2 = run(work, tmp_path / "c2", "--types", "image", "--include-system")
+    m = s2.member("Games/SomeGame/textures/beach.jpg")
+    assert m is not None and "system" in m.flags and m.suggest == "keep" and not m.keeper
+
+
+def test_failed_move_is_logged_as_failed(served, monkeypatch):
+    s, server = served
+    def broken(p):
+        raise OSError("disk unplugged")
+    monkeypatch.setattr(df, "trash_file", broken)
+    monkeypatch.setattr(df, "drive_kind", lambda p: "fixed")
+    monkeypatch.setattr(df, "recycle_bin_problem", lambda p, n: None)
+    fid = s.rec("photos/backup/beach copy.jpg").fid
+    res = move(server, [fid])[fid]
+    assert not res["ok"] and "disk unplugged" in res["reason"]
+    last = s.cache.actions()[-1]
+    assert last["action"] == "failed" and last["path"].endswith("beach copy.jpg")
+    assert os.path.exists(s.rec("photos/backup/beach copy.jpg").path)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the real Windows Recycle Bin")
+def test_real_windows_recycle_bin(tmp_path):
+    import uuid
+    name = f"dupefinder-rb-test-{uuid.uuid4().hex[:12]}"
+    path = tmp_path / f"{name}.txt"
+    path.write_text("DupeFinder Recycle Bin test")
+    assert df.drive_kind(str(path)) == "fixed"
+    assert df.volume_root(str(path)).endswith("\\")
+    assert df.recycle_bin_problem(str(path), path.stat().st_size) is None
+    df.trash_file(str(path))
+    assert not path.exists()
+    ps = ("$items = (New-Object -ComObject Shell.Application).NameSpace(10).Items(); "
+          f"@($items | Where-Object {{ $_.Name -like '{name}*' }}).Count")
+    out = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                         capture_output=True, text=True, timeout=60)
+    assert out.stdout.strip() == "1", out.stdout + out.stderr

@@ -113,6 +113,7 @@ WINDOWS_ROOT_SYSTEM = {
     "windows.old", "$windows.~bt", "$windows.~ws", "$winreagent", "$sysreset",
     "perflogs", "msocache", "config.msi", "onedrivetemp",
 }
+PROGRAM_FILE_EXTS = (".dll",)   # a folder holding these belongs to a program
 ANYWHERE_SYSTEM = {".git", "node_modules", "venv", ".venv", "site-packages",
                    # Game and app libraries keep program files outside Program Files.
                    "steamapps", "steamlibrary", "epic games", "xboxgames", "windowsapps",
@@ -417,6 +418,7 @@ class ScanStats:
     finished: float = 0.0
     files_seen: int = 0
     system_skipped: int = 0
+    program_skipped: int = 0
     excluded: int = 0
     links: int = 0
     online_only: int = 0
@@ -432,6 +434,7 @@ class ScanStats:
     def counts(self) -> dict:
         c = {
             "System or program folders": self.system_skipped,
+            "Other program folders (they contain .dll files)": self.program_skipped,
             "Excluded folders (--exclude)": self.excluded,
             "Links and junctions not followed": self.links,
             "Online-only (OneDrive) files, not downloaded": self.online_only,
@@ -529,21 +532,30 @@ class Walker:
                 self.stats.denied.append((folder, e.strerror or str(e)))
                 log.info("Skipped %s: %s", folder, e)
                 continue
-            subdirs = []
+            entries = []
             complete = True
             with it:
                 while True:
                     try:
-                        entry = next(it)
+                        entries.append(next(it))
                     except StopIteration:
                         break
                     except OSError as e:
                         self.stats.denied.append((folder, e.strerror or str(e)))
                         complete = False
                         break
-                    rec = self._visit(folder, entry, in_system, subdirs)
-                    if rec is not None:
-                        yield rec
+            if any(e.name.lower().endswith(PROGRAM_FILE_EXTS) for e in entries):
+                # Program files live here (e.g. a game, a portable app, a Python
+                # install): their images must stay put, whatever the folder's name.
+                if folder != root and not self.opts.include_system:
+                    self.stats.program_skipped += 1
+                    continue
+                in_system = True
+            subdirs = []
+            for entry in entries:
+                rec = self._visit(folder, entry, in_system, subdirs)
+                if rec is not None:
+                    yield rec
             if complete:
                 self.listed.add(path_key(folder))
             # Reverse so folders are visited in name order.
@@ -778,11 +790,18 @@ class Cache:
     def log_action(self, scan_id, path, action, destination, group_id, kept_path,
                    file_sha, size, note=""):
         with self.lock:
-            self.db.execute(
+            cur = self.db.execute(
                 "INSERT INTO actions (time, scan_id, path, action, destination, group_id, "
                 "kept_path, file_sha256, size, note) VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (dt.datetime.now().isoformat(timespec="seconds"), scan_id, path, action,
                  destination, group_id, kept_path, file_sha, size, note))
+            self.db.commit()
+            return cur.lastrowid
+
+    def mark_failed(self, action_id: int, why: str):
+        with self.lock:
+            self.db.execute("UPDATE actions SET action='failed', note=? WHERE id=?",
+                            (why, action_id))
             self.db.commit()
 
     def actions(self) -> list[dict]:
@@ -1998,6 +2017,9 @@ class Grouper:
             else:
                 key = lambda r: (-r.pixels, -r.size, has_copy_marker(r.path),
                                  r.taken_at if r.taken_at is not None else inf, r.path)
+        elif all(r.meta.get("scanned") for r in pool):
+            # Scans with no text: the bigger file is the better-quality scan.
+            key = lambda r: (has_copy_marker(r.path), -r.size, -r.mtime_ns, len(r.path), r.path)
         else:
             key = lambda r: (has_copy_marker(r.path), -r.mtime_ns,
                              -(r.meta.get("pages") or 0), len(r.path), r.path)
@@ -2307,8 +2329,8 @@ def review_destination(path: str) -> str:
     return dest
 
 
-def move_to_review(path: str) -> str:
-    dest = review_destination(path)
+def move_to_review(path: str, dest: str | None = None) -> str:
+    dest = dest or review_destination(path)
     os.makedirs(io_path(os.path.dirname(dest)), exist_ok=True)
     os.rename(io_path(path), io_path(dest))   # same drive, so this is a rename
     return dest
@@ -2399,20 +2421,27 @@ class Mover:
             if problem:
                 method, note = "review", problem
         keeper = self.r.recs[g.keeper].path if g.keeper is not None else ""
+        dest = "Recycle Bin" if method == "recycle" else review_destination(rec.path)
+        # Log first, so even a crash or power cut mid-move leaves a record
+        # that --undo-review and actions.csv can use.
+        try:
+            action_id = self.cache.log_action(self.r.scan_id, rec.path, method, dest, g.gid,
+                                              keeper, rec.file_sha, rec.size, note)
+        except Exception as e:
+            return {"ok": False, "reason": f"Couldn't write the action log, so nothing was moved: {e}"}
         try:
             if method == "recycle":
                 trash_file(rec.path)
                 if os.path.lexists(io_path(rec.path)):
+                    self.cache.mark_failed(action_id, "the Recycle Bin didn't take the file")
                     return {"ok": False, "reason": "The Recycle Bin didn't take the file"}
-                dest = "Recycle Bin"
             else:
-                dest = move_to_review(rec.path)
+                move_to_review(rec.path, dest)
         except Exception as e:
             log.warning("Move failed for %s: %s", rec.path, e)
+            self.cache.mark_failed(action_id, describe_error(e))
             return {"ok": False, "reason": f"Couldn't move the file: {describe_error(e)}"}
         self.moved[rec.fid] = dest
-        self.cache.log_action(self.r.scan_id, rec.path, method, dest, g.gid, keeper,
-                              rec.file_sha, rec.size, note)
         log.info("Moved %s -> %s", rec.path, dest)
         return {"ok": True, "action": method, "dest": dest}
 
@@ -2654,12 +2683,24 @@ def cached_analysis_usable(rec: FileRec, row: dict, opts) -> bool:
     return True
 
 
+def own_folders(cache_dir: str) -> list[str]:
+    """DupeFinder's cache and the Python running it (the bundled one included)."""
+    home = path_key(os.path.expanduser("~"))
+    dirs = [normalize_root(cache_dir)]
+    for p in {sys.prefix, sys.base_prefix}:
+        p = os.path.abspath(p)
+        if os.path.isdir(p) and not is_drive_root(p) and path_key(p) != home \
+                and len(Path(p).parts) > 2:
+            dirs.append(p)
+    return dirs
+
+
 def run_scan(opts, cache: Cache, show_progress: bool = True) -> ScanResult:
     stats = ScanStats()
     prog = Progress(show_progress)
     scan_id = cache.start_scan(opts.roots, {k: v for k, v in vars(opts).items()
                                             if k not in ("type_set",)})
-    walker = Walker(opts, stats, own_dirs=[normalize_root(cache.dir)])
+    walker = Walker(opts, stats, own_dirs=own_folders(cache.dir))
     recs: list[FileRec] = []
     try:
         for rec in walker.walk(opts.roots):
@@ -2936,7 +2977,14 @@ SERVER_CSP = ("default-src 'none'; img-src 'self' data: blob:; style-src 'unsafe
 
 
 def render_report(data: dict) -> str:
-    html = REPORT_TEMPLATE.replace("__DF_DATA__", json_for_script(data), 1)
+    # The data rides in a JSON block: browsers parse big JSON far faster than
+    # the same data written as a JavaScript literal (seconds saved on huge scans).
+    html = REPORT_TEMPLATE.replace(
+        "__DF_DATA__", 'JSON.parse(document.getElementById("df-data").textContent)', 1)
+    start = html.index("<body")
+    start = html.index(">", start) + 1
+    html = (html[:start] + '\n<script id="df-data" type="application/json">'
+            + json_for_script(data) + "</script>" + html[start:])
     if data["mode"] == "static":
         html = html.replace("<head>", '<head>\n<meta http-equiv="Content-Security-Policy" '
                                       f'content="{STATIC_CSP}">', 1)

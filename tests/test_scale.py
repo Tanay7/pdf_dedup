@@ -55,3 +55,21 @@ def test_scan_of_thousands_of_real_files(tmp_path):
     assert len(s.result.recs) == 2020 and not st.errors
     identical = [g for g in s.result.groups if g.type == "identical"]
     assert len(identical) >= 20
+
+
+def test_report_for_20k_groups_builds_fast_and_parses(tmp_path):
+    import json
+    import re
+    data = {"mode": "server", "token": "t", "generated": "", "summary": {}, "skipped": {},
+            "groups": [{"id": g, "type": "similar", "kind": "image", "title": "2 similar files",
+                        "space": 1, "min_score": 90, "burst_shots": None,
+                        "members": [{"fid": 2 * g + k, "name": f"<x>{g}.jpg", "path": f"D:\\a\\{g}.jpg",
+                                     "keeper": k == 0} for k in range(2)]}
+                       for g in range(20000)]}
+    t = time.time()
+    html = df.render_report(data)
+    assert time.time() - t < 10
+    block = re.search(r'<script id="df-data" type="application/json">(.*?)</script>', html, re.S).group(1)
+    assert "<x>" not in block                     # names can't break out of the data block
+    assert len(json.loads(block)["groups"]) == 20000
+    assert 'JSON.parse(document.getElementById("df-data").textContent)' in html
