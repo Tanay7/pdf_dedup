@@ -235,6 +235,11 @@ release.
 
 ## Notes
 
+- **Tested at scale:** an end-to-end run on 103,031 photos took about 12
+  minutes for the first scan and 2 minutes to rescan, on 4 CPU cores with
+  peak memory under 0.9 GB. Photo matching across 60,000 photos takes about
+  10 s. A report with 20,000 groups opens in about 3 s.
+
 - **Platforms:** built for Windows 10/11. It also runs on macOS and Linux,
   where files go to the system Trash, and mounted drives under `/media`,
   `/run/media`, `/mnt` or `/Volumes` use the review folder instead.

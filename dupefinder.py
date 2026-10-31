@@ -2685,7 +2685,7 @@ def open_in_system(path: str, reveal: bool):
         if reveal:
             subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])
         else:
-            os.startfile(path)  # noqa: S606 - opens with the default app
+            os.startfile(path)  # opens with the default app
     elif IS_MAC:
         subprocess.Popen(["open", "-R", path] if reveal else ["open", path])
     else:
@@ -2709,7 +2709,7 @@ def _rgb_for_jpeg(im):
 
 
 def make_thumbnail(rec: FileRec, thumbs_dir: str, size: int = 256) -> str | None:
-    key = hashlib.sha1(f"{rec.path}|{rec.size}|{rec.mtime_ns}".encode("utf-8")).hexdigest()
+    key = hashlib.sha1(f"{rec.path}|{rec.size}|{rec.mtime_ns}".encode()).hexdigest()
     out = os.path.join(thumbs_dir, key[:2], key + ".jpg")
     if os.path.exists(out):
         return out
@@ -2910,6 +2910,7 @@ def run_scan(opts, cache: Cache, show_progress: bool = True) -> ScanResult:
             reused.append(r.path)
     stats.from_cache = len(reused)
     cache.touch(reused, scan_id)
+    del rows                          # cached rows are applied; free them on huge scans
 
     pool = WorkerPool(opts.workers, worker_settings(opts), opts.timeout)
     try:
@@ -3636,7 +3637,7 @@ def parse_args(argv=None):
         roots.append(root)
     keys = sorted({path_key(r): r for r in roots}.items(), key=lambda kv: len(kv[0]))
     kept = []
-    for k, r in keys:   # drop roots nested inside another root
+    for _k, r in keys:   # drop roots nested inside another root
         if not any(is_under(r, path_key(x)) for x in kept):
             kept.append(r)
     opts.roots = kept
