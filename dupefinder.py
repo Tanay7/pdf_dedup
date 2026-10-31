@@ -93,6 +93,7 @@ MINHASH_PERM = 128
 LSH_RECALL = 0.98
 REVIEW_DIR = "_duplicates_review"
 DEFAULT_BLUR_CUTOFF = 45.0   # on the 0-100 sharpness score; tune with --blur-cutoff
+MAX_POOR_LISTED = 2000       # possibly poor shots listed in the report (worst first)
 COLOUR_DIFF_CUT = 28.0       # chroma difference (0-255 scale) above which photos differ in colour
 WORKER_CRASH = "The worker process"   # errors starting with this are retried next scan
 IDLE_TIMEOUT = 30 * 60
@@ -2047,6 +2048,7 @@ class Group:
     members: list
     keeper: int | None
     burst_shots: int | None = None
+    total: int | None = None          # poor shots flagged in all (the list is capped)
 
     def space(self, recs) -> int:
         return sum(recs[m.fid].size for m in self.members if m.suggest == "trash")
@@ -2393,8 +2395,13 @@ class Grouper:
         if not members:
             return None
         members.sort(key=lambda m: (self.recs[m.fid].sharpness or 0, self.recs[m.fid].path))
-        return Group(gid=gid, type="poor", kind="image",
-                     title=f"{len(members)} possibly poor shots", members=members, keeper=None)
+        total = len(members)
+        title = f"{total:,} possibly poor shots"
+        if total > MAX_POOR_LISTED:      # a list this long helps nobody: show the worst
+            members = members[:MAX_POOR_LISTED]
+            title = f"The {MAX_POOR_LISTED:,} worst of {total:,} possibly poor shots"
+        return Group(gid=gid, type="poor", kind="image", title=title, members=members,
+                     keeper=None, total=total)
 
 
 # --------------------------------------------------------------------------
@@ -3118,7 +3125,7 @@ def report_data(result: ScanResult, mode: str, token: str = "", thumbs: dict | N
             "photos": sum(r.kind == "image" for r in recs),
             "groups": len(dup_groups),
             "bursts": sum(g.type == "burst" for g in dup_groups),
-            "poor": sum(len(g.members) for g in result.groups if g.type == "poor"),
+            "poor": sum(g.total or len(g.members) for g in result.groups if g.type == "poor"),
             "space_to_free": sum(g.space(recs) for g in dup_groups),
             "scan_seconds": round((s.finished or time.time()) - s.started, 1),
             "roots": result.roots,
@@ -3663,7 +3670,7 @@ def setup_logging(cache_dir: str) -> str:
 def print_summary(result: ScanResult):
     s, recs = result.stats, result.recs
     dup = [g for g in result.groups if g.type != "poor"]
-    poor = sum(len(g.members) for g in result.groups if g.type == "poor")
+    poor = sum(g.total or len(g.members) for g in result.groups if g.type == "poor")
     space = sum(g.space(recs) for g in dup)
     print(f"\n{len(recs):,} files scanned in {s.finished - s.started:.0f} s: "
           f"{len(dup):,} duplicate groups ({sum(g.type == 'burst' for g in dup)} bursts), "
